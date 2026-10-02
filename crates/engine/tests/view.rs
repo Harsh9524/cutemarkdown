@@ -295,7 +295,10 @@ fn select_all_copies_structured_text() {
 #[test]
 fn reload_keeps_the_reader_in_place() {
     let mut h = Harness::new();
-    let src = std::fs::read_to_string(std::path::Path::new(SAMPLES).join("ai-report.md")).unwrap();
+    // Normalise line endings: Windows checkouts may use CRLF, and the edit below matches "\n".
+    let src = std::fs::read_to_string(std::path::Path::new(SAMPLES).join("ai-report.md"))
+        .unwrap()
+        .replace("\r\n", "\n");
     let mut view = DocView::new(Document::parse(&src, None));
     h.settle(&mut view);
     view.scroll_to_anchor("rollback-plan");
