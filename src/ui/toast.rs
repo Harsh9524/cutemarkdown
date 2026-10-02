@@ -16,14 +16,25 @@ pub fn show(ctx: &egui::Context, screen: Rect, toast: &Toast, p: &Palette) -> bo
     if age >= life {
         return false;
     }
-    let fade_in = (age / FADE).min(1.0);
-    let fade_out = ((life - age) / FADE).clamp(0.0, 1.0);
+    // With animations off it simply appears and disappears.
+    let fade = super::anim_secs(ctx, FADE);
+    let (fade_in, fade_out) = if fade > 0.0 {
+        ((age / fade).min(1.0), ((life - age) / fade).clamp(0.0, 1.0))
+    } else {
+        (1.0, 1.0)
+    };
     let alpha = egui::emath::easing::cubic_out(fade_in).min(fade_out);
     let rise = 8.0 * (1.0 - egui::emath::easing::cubic_out(fade_in));
 
     let (bg, fg) = (p.text, p.bg);
     let painter = ctx.layer_painter(egui::LayerId::new(Order::Tooltip, Id::new("toast-measure")));
-    let g = widgets::galley(&painter, &toast.text, 13.0, fg, Some(screen.width() * 0.8));
+    let g = widgets::galley_with(
+        &painter,
+        &toast.text,
+        widgets::medium(13.0),
+        fg,
+        Some(screen.width() * 0.8),
+    );
     let icon_w = if toast.icon.is_some() {
         14.0 + 8.0
     } else {
@@ -60,6 +71,10 @@ pub fn show(ctx: &egui::Context, screen: Rect, toast: &Toast, p: &Palette) -> bo
             painter.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, fg);
             ui.allocate_rect(rect, egui::Sense::hover());
         });
-    ctx.request_repaint();
+    if fade > 0.0 {
+        ctx.request_repaint();
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(life - age));
+    }
     true
 }

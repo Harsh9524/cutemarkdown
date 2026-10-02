@@ -103,7 +103,10 @@ pub fn visuals(kind: ThemeKind, p: &Palette) -> Visuals {
 
 /// Apply theme visuals plus the shell's spacing and tooltip timing to every egui style (so the
 /// result doesn't depend on which theme egui itself thinks is active).
-pub fn apply(ctx: &egui::Context, kind: ThemeKind, p: &Palette) {
+///
+/// `animations` off (Windows "Show animations") sets `animation_time` to 0: the engine then
+/// jumps instead of animating scrolls, and the chrome skips its transitions (`ui::anim_secs`).
+pub fn apply(ctx: &egui::Context, kind: ThemeKind, p: &Palette, animations: bool) {
     let visuals = visuals(kind, p);
     ctx.all_styles_mut(|s| {
         s.visuals = visuals.clone();
@@ -111,7 +114,7 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind, p: &Palette) {
         s.interaction.selectable_labels = false;
         s.spacing.menu_margin = egui::Margin::symmetric(10, 6);
         s.spacing.item_spacing = egui::vec2(8.0, 4.0);
-        s.animation_time = 0.12;
+        s.animation_time = if animations { 0.12 } else { 0.0 };
     });
 }
 
@@ -137,14 +140,16 @@ pub fn measure(width: Width, text_size: f32, area_w: f32) -> f32 {
     nominal_measure(width, text_size).map_or(avail, |m| m.min(avail))
 }
 
-/// The engine style for the current settings.
-pub fn engine_style(kind: ThemeKind, s: &Settings, measure: f32) -> Style {
+/// The engine style for the current settings. `top_inset` is the height of the chrome over the
+/// top of the document: the 44 px app bar, or 0 in Zen.
+pub fn engine_style(kind: ThemeKind, s: &Settings, measure: f32, top_inset: f32) -> Style {
     let font = match s.font {
         FontPref::Sans => FontChoice::Sans,
         FontPref::Serif => FontChoice::Serif,
     };
     let mut style = Style::new(kind, font, s.text_size, measure);
     style.wrap_code = s.wrap_code;
+    style.top_inset = top_inset;
     style
 }
 

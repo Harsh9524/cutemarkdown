@@ -120,7 +120,7 @@ pub fn show(
                         st,
                         p,
                     );
-                    if tooltip(r, "Back", Some("Alt+Left"), p).clicked() {
+                    if tooltip(r, "Back", Some("Alt+←"), p).clicked() {
                         actions.push(Action::Back);
                     }
                     x += BTN + GAP;
@@ -136,7 +136,7 @@ pub fn show(
                         st,
                         p,
                     );
-                    if tooltip(r, "Forward", Some("Alt+Right"), p).clicked() {
+                    if tooltip(r, "Forward", Some("Alt+→"), p).clicked() {
                         actions.push(Action::Forward);
                     }
                 }
@@ -166,7 +166,9 @@ pub fn show(
                 toggled: props.popover == Some(Popover::Aa),
                 disabled: false,
             };
-            let r = icon_button(ui, out.aa_button, "aa", Glyph::Text("Aa", 15.0), st, p);
+            // "Aa" is text, not an icon: Inter 15/600 (SPEC §3).
+            let aa = Glyph::Text("Aa", widgets::semibold(15.0));
+            let r = icon_button(ui, out.aa_button, "aa", aa, st, p);
             if tooltip(r, "Reading settings", Some("Ctrl+,"), p).clicked() {
                 actions.push(Action::TogglePopover(Popover::Aa));
             }

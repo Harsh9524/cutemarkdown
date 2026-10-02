@@ -16,7 +16,8 @@ use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_OK, MessageBoxW, SW_SHOWNORMAL,
+    MB_ICONERROR, MB_OK, MessageBoxW, SPI_GETCLIENTAREAANIMATION, SW_SHOWNORMAL,
+    SystemParametersInfoW,
 };
 
 fn wide(s: &OsStr) -> Vec<u16> {
@@ -76,6 +77,17 @@ fn shell_execute(verb: &str, file: &OsStr) -> io::Result<()> {
             r as usize
         )))
     }
+}
+
+/// Windows "Show animations in Windows" (Settings > Accessibility > Visual effects). When it's
+/// off, nothing in the app animates (SPEC §7). Defaults to on if the query fails.
+pub fn animations_enabled() -> bool {
+    let mut on: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes a single BOOL (i32) through the pointer, which
+    // points at a live local for the duration of the call.
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut on).cast(), 0) };
+    ok == 0 || on != 0
 }
 
 /// Whether a window rectangle (logical points) overlaps any monitor.

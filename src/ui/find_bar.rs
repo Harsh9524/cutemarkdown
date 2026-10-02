@@ -1,4 +1,5 @@
-//! Find bar (SPEC §3): a 340×40 card at the top right of the content, below the bar.
+//! Find bar (SPEC §3): a 340×40 card at the top right of the content, below the bar:
+//! `search` icon · input · count · ↑ ↓ · `Aa` match case · ×.
 
 use std::time::Instant;
 
@@ -67,7 +68,8 @@ pub fn show(
 
             let close =
                 Rect::from_center_size(pos2(rect.right() - 6.0 - BTN / 2.0, cy), vec2(BTN, BTN));
-            let down = close.translate(vec2(-(BTN + 2.0), 0.0));
+            let case = close.translate(vec2(-(BTN + 2.0), 0.0));
+            let down = case.translate(vec2(-(BTN + 2.0), 0.0));
             let up = down.translate(vec2(-(BTN + 2.0), 0.0));
             let st = ButtonState::default();
             let has_query = !state.sent.is_empty();
@@ -96,6 +98,15 @@ pub fn show(
             );
             if tooltip(r, "Next match", Some("Enter"), p).clicked() {
                 actions.push(Action::FindNext);
+            }
+            let case_st = ButtonState {
+                toggled: state.case_sensitive,
+                disabled: false,
+            };
+            let aa = Glyph::Text("Aa", widgets::semibold(13.0));
+            let r = icon_button(ui, case, "find-case", aa, case_st, p);
+            if tooltip(r, "Match case", None, p).clicked() {
+                actions.push(Action::ToggleFindCase);
             }
             let r = icon_button(ui, close, "find-close", Glyph::Icon(Icon::X, 16.0), st, p);
             if tooltip(r, "Close", Some("Esc"), p).clicked() {

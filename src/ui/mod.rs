@@ -31,6 +31,18 @@ pub const OUTLINE_W: f32 = 264.0;
 pub const OUTLINE_OVERLAY_W: f32 = 280.0;
 /// Panel animation time.
 pub const PANEL_SECS: f32 = 0.16;
+/// Hover transition time (SPEC §7 General states).
+pub const HOVER_SECS: f32 = 0.12;
+
+/// `secs`, or 0 when animations are off (Windows "Show animations", SPEC §7). The app sets
+/// egui's `animation_time` to 0 in that case; the engine reads the same flag.
+pub fn anim_secs(ctx: &egui::Context, secs: f32) -> f32 {
+    if ctx.global_style().animation_time <= 0.0 {
+        0.0
+    } else {
+        secs
+    }
+}
 
 /// Something the user asked for this frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -47,16 +59,21 @@ pub enum Action {
     Reload,
     CopySource,
     OpenInEditor,
+    /// "Open in editor here" from a heading's context menu: 1-based source line.
+    OpenInEditorAt(usize),
     Reveal,
     Link(LinkTarget, bool),
     ScrollToHeading(usize),
-    HeadingStep(i32),
     ToggleOutline,
     CloseOutlineOverlay,
     OpenFind,
     CloseFind,
+    /// Esc in the find bar: the current match becomes the selection, then find closes.
+    EscapeFind,
     FindNext,
     FindPrev,
+    /// The find bar's `Aa` match-case toggle.
+    ToggleFindCase,
     TogglePopover(Popover),
     ClosePopover,
     ToggleZen,
@@ -137,6 +154,8 @@ pub struct FindState {
     pub focus: bool,
     /// Show "Wrapped" instead of the count until then.
     pub wrapped_until: Option<Instant>,
+    /// Match case (the `Aa` toggle). Kept for the window's lifetime, across documents.
+    pub case_sensitive: bool,
 }
 
 /// Transient chrome state (not persisted).

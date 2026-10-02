@@ -151,9 +151,11 @@ fn contents(
                 let indent = f32::from(e.depth) * 14.0;
                 let pill = Rect::from_min_max(pos2(row.left() + indent, row.top()), row.max);
                 let painter = ui.painter();
-                let hover_t =
-                    ui.ctx()
-                        .animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+                let hover_t = ui.ctx().animate_bool_with_time(
+                    resp.id.with("h"),
+                    resp.hovered(),
+                    super::anim_secs(ui.ctx(), super::HOVER_SECS),
+                );
                 let color = if is_active {
                     painter.rect_filled(pill, 6.0, p.accent_soft);
                     painter.rect_filled(

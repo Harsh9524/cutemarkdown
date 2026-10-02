@@ -30,6 +30,11 @@ pub fn open_in_editor(path: &Path) -> io::Result<()> {
     spawn_detached(Command::new("xdg-open").arg(path))
 }
 
+/// Whether the desktop wants UI animations. Only Windows exposes a setting we read.
+pub fn animations_enabled() -> bool {
+    true
+}
+
 pub fn rect_on_screen(_x: f32, _y: f32, _w: f32, _h: f32) -> bool {
     true
 }

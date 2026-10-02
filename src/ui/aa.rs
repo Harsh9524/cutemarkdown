@@ -1,9 +1,10 @@
 //! The Aa popover (SPEC §8): theme, font, text size, width and code wrapping, applied live.
 
 use egui::{
-    Align2, Area, Color32, Id, Order, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+    Align2, Area, Color32, FontFamily, Id, Order, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Ui,
+    pos2, vec2,
 };
-use engine::{Palette, ThemeKind};
+use engine::{Palette, ThemeKind, fonts};
 
 use super::widgets::{self, ButtonState, Glyph, font, icon_button, segmented, switch};
 use super::{Action, BAR_H};
@@ -84,7 +85,9 @@ pub fn show(
             y += 24.0;
             let row = Rect::from_min_size(pos2(left, y), vec2(inner_w, 32.0));
             let sel = usize::from(s.font == FontPref::Serif);
-            if let Some(i) = segmented(ui, row, "font", &["Sans", "Serif"], sel, p) {
+            // Each option is set in its own face: "Sans" in Inter, "Serif" in Literata.
+            let options = [("Sans", fonts::ui_medium()), ("Serif", fonts::serif())];
+            if let Some(i) = segmented(ui, row, "font", &options, sel, p) {
                 actions.push(Action::SetFont(if i == 0 {
                     FontPref::Sans
                 } else {
@@ -164,9 +167,12 @@ pub fn show(
             label(ui, pos2(left, y), "Width", p);
             y += 24.0;
             let row = Rect::from_min_size(pos2(left, y), vec2(inner_w, 32.0));
-            let labels: Vec<&str> = Width::ALL.iter().map(|w| w.label()).collect();
+            let options: Vec<(&str, FontFamily)> = Width::ALL
+                .iter()
+                .map(|w| (w.label(), fonts::ui_medium()))
+                .collect();
             let sel = Width::ALL.iter().position(|&w| w == s.width).unwrap_or(1);
-            if let Some(i) = segmented(ui, row, "width", &labels, sel, p) {
+            if let Some(i) = segmented(ui, row, "width", &options, sel, p) {
                 actions.push(Action::SetWidth(Width::ALL[i]));
             }
             y += 32.0 + 16.0;
@@ -187,9 +193,15 @@ pub fn show(
     rect
 }
 
+/// Row label: 12/600 `muted` (SPEC §8).
 fn label(ui: &Ui, pos: Pos2, text: &str, p: &Palette) {
-    ui.painter()
-        .text(pos, Align2::LEFT_TOP, text, font(12.0), p.muted);
+    ui.painter().text(
+        pos,
+        Align2::LEFT_TOP,
+        text,
+        widgets::semibold(12.0),
+        p.muted,
+    );
 }
 
 /// A theme swatch: its own `bg`, "Aa" in its `text` and a 6 px `accent` dot. Auto is split
@@ -204,7 +216,7 @@ fn paint_swatch(ui: &Ui, r: Rect, pref: ThemePref, current: &Palette) {
         ThemePref::Dark => dark.clone(),
     };
     painter.rect_filled(r, 8.0, pal.bg);
-    let text_galley = |c: Color32| painter.layout_no_wrap("Aa".into(), font(15.0), c);
+    let text_galley = |c: Color32| painter.layout_no_wrap("Aa".into(), widgets::semibold(15.0), c);
     let g = text_galley(pal.text);
     let text_pos = pos2(
         r.center().x - (g.size().x + 9.0) / 2.0,

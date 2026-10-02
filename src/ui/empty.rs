@@ -5,7 +5,7 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use engine::Palette;
 
 use super::widgets::{self, ButtonState, Glyph, font, icon_button};
-use super::{Action, BAR_H};
+use super::{Action, BAR_H, HOVER_SECS};
 use crate::icons::{self, Icon};
 use crate::settings::{RECENT_SHOWN, RecentEntry};
 
@@ -43,23 +43,29 @@ pub fn show(
         pos2(cx, y),
         Align2::CENTER_TOP,
         "Open a Markdown file",
-        font(20.0),
+        widgets::weighted(20.0, 650),
         p.text_strong,
     );
     y += 26.0 + 6.0;
     hint_line(&painter, pos2(cx, y + 10.0), p);
     y += 20.0 + 20.0;
 
-    // Primary button.
-    let label = widgets::galley(&painter, "Open file…", 14.0, p.on_accent, None);
+    // Primary button: 14/600 `on-accent` on `accent`.
+    let label = widgets::galley_with(
+        &painter,
+        "Open file…",
+        widgets::semibold(14.0),
+        p.on_accent,
+        None,
+    );
     let btn = Rect::from_min_size(
         pos2(cx - (label.size().x + 32.0) / 2.0, y),
         vec2(label.size().x + 32.0, 36.0),
     );
     let resp = ui.interact(btn, ui.id().with("open-file"), Sense::click());
-    let hover_t = ui
-        .ctx()
-        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let ctx = ui.ctx().clone();
+    let hover_t =
+        ctx.animate_bool_with_time(resp.id, resp.hovered(), super::anim_secs(&ctx, HOVER_SECS));
     painter.rect_filled(btn, 8.0, darken(p.accent, 0.06 * hover_t));
     painter.galley(btn.center() - label.size() / 2.0, label, p.on_accent);
     if resp.has_focus() {
@@ -114,10 +120,10 @@ fn recent_row(
     let text_left = row.left() + 40.0;
     let text_w = row.width() - 40.0 - 44.0;
     let name = super::menu::file_name(&entry.path);
-    let name_g = widgets::galley(
+    let name_g = widgets::galley_with(
         &painter,
         &name,
-        14.0,
+        widgets::medium(14.0),
         if missing { p.muted } else { p.text },
         Some(text_w - if missing { 60.0 } else { 0.0 }),
     );
@@ -180,12 +186,7 @@ fn hint_line(painter: &egui::Painter, center: Pos2, p: &Palette) {
     ];
     let size = 14.0;
     let text_w = |s: &str| widgets::galley(painter, s, size, p.muted, None).size().x;
-    let key_w = |s: &str| {
-        widgets::galley(painter, s, size * 0.86, p.text, None)
-            .size()
-            .x
-            + 12.0
-    };
+    let key_w = |s: &str| widgets::keycap_width(painter, s, size);
     let total: f32 = runs
         .iter()
         .map(|r| match r {

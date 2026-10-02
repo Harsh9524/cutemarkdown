@@ -5,16 +5,33 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Galley, Painter, Pos2, Rect, Response, Sense, Shadow,
-    Stroke, StrokeKind, Ui, pos2, vec2,
+    Align2, Color32, CornerRadius, FontFamily, FontId, Galley, Painter, Pos2, Rect, Response,
+    Sense, Shadow, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 use engine::Palette;
+use engine::fonts::{self, Face};
 
 use crate::icons::{self, Icon};
 
-/// UI font. (Weights need named families from `engine::fonts`; see the report.)
+/// UI font: Inter 400.
 pub fn font(size: f32) -> FontId {
     FontId::proportional(size)
+}
+
+/// Inter 500 (SPEC: recent file names, toasts, keycaps).
+pub fn medium(size: f32) -> FontId {
+    FontId::new(size, fonts::ui_medium())
+}
+
+/// Inter 600 (SPEC: "Aa", overlines, Aa popover labels, the primary button).
+pub fn semibold(size: f32) -> FontId {
+    FontId::new(size, fonts::ui_semibold())
+}
+
+/// Inter at any of the bundled weights (400, 500, 600, 650, 700), e.g. the 20/650 empty-state
+/// title.
+pub fn weighted(size: f32, weight: u16) -> FontId {
+    FontId::new(size, fonts::family(Face::Sans, weight))
 }
 
 /// Lay out one line of text, truncated with "…" at `max_width` if given.
@@ -25,18 +42,29 @@ pub fn galley(
     color: Color32,
     max_width: Option<f32>,
 ) -> Arc<Galley> {
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font(size), color));
+    galley_with(painter, text, font(size), color, max_width)
+}
+
+/// [`galley`] in any font.
+pub fn galley_with(
+    painter: &Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: Option<f32>,
+) -> Arc<Galley> {
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat::simple(font, color));
     if let Some(w) = max_width {
         job.wrap = TextWrapping::truncate_at_width(w.max(1.0));
     }
     painter.layout_job(job)
 }
 
-/// Uppercase overline with +0.08em tracking (`CONTENTS`, `RECENT`).
+/// Uppercase overline, 11/600 with +0.08em tracking (`CONTENTS`, `RECENT`).
 pub fn overline(painter: &Painter, pos: Pos2, text: &str, color: Color32) -> Rect {
     let size = 11.0;
     let format = TextFormat {
-        font_id: font(size),
+        font_id: semibold(size),
         color,
         extra_letter_spacing: 0.08 * size,
         ..Default::default()
@@ -120,7 +148,7 @@ pub struct ButtonState {
 /// What a button draws.
 pub enum Glyph<'a> {
     Icon(Icon, f32),
-    Text(&'a str, f32),
+    Text(&'a str, FontId),
 }
 
 /// A square chrome button (32×32 in the bar, 28×28 in the find bar). SPEC §3 states:
@@ -142,9 +170,11 @@ pub fn icon_button(
     };
     let resp = ui.interact(rect, id, sense);
     let painter = ui.painter();
-    let hover_t =
-        ui.ctx()
-            .animate_bool_with_time(id.with("hover"), resp.hovered() && !state.disabled, 0.12);
+    let hover_t = ui.ctx().animate_bool_with_time(
+        id.with("hover"),
+        resp.hovered() && !state.disabled,
+        super::anim_secs(ui.ctx(), super::HOVER_SECS),
+    );
     let (fill, fg) = if state.disabled {
         (Color32::TRANSPARENT, p.faint)
     } else if resp.is_pointer_button_down_on() {
@@ -160,8 +190,8 @@ pub fn icon_button(
     painter.rect_filled(rect, 8.0, fill);
     match glyph {
         Glyph::Icon(icon, size) => icons::paint(ui, icon, rect, size, fg),
-        Glyph::Text(text, size) => {
-            painter.text(rect.center(), Align2::CENTER_CENTER, text, font(size), fg);
+        Glyph::Text(text, font) => {
+            painter.text(rect.center(), Align2::CENTER_CENTER, text, font, fg);
         }
     }
     if resp.has_focus() && !state.disabled {
@@ -198,10 +228,23 @@ pub fn tooltip(resp: Response, label: &str, shortcut: Option<&str>, p: &Palette)
     }
 }
 
-/// A `<kbd>`-style keycap (SPEC §6): `text` on `surface`, 1 px `border-strong` with a 2 px bottom
-/// edge, radius 4, padding 1×6. Returns its width.
+fn keycap_font(size: f32) -> FontId {
+    medium(size * 0.86)
+}
+
+/// Width of a [`keycap`] for `label` next to `size` text.
+pub fn keycap_width(painter: &Painter, label: &str, size: f32) -> f32 {
+    painter
+        .layout_no_wrap(label.to_owned(), keycap_font(size), Color32::WHITE)
+        .size()
+        .x
+        + 12.0
+}
+
+/// A `<kbd>`-style keycap (SPEC §6): Inter 500 `text` on `surface`, 1 px `border-strong` with a
+/// 2 px bottom edge, radius 4, padding 1×6. Returns its width.
 pub fn keycap(painter: &Painter, left_center: Pos2, label: &str, size: f32, p: &Palette) -> f32 {
-    let g = painter.layout_no_wrap(label.to_owned(), font(size * 0.86), p.text);
+    let g = painter.layout_no_wrap(label.to_owned(), keycap_font(size), p.text);
     let w = g.size().x + 12.0;
     let h = g.size().y + 2.0;
     let rect = Rect::from_min_size(pos2(left_center.x, left_center.y - h / 2.0), vec2(w, h));
@@ -229,12 +272,13 @@ pub fn track_colors(p: &Palette) -> (Color32, Color32) {
     }
 }
 
-/// Segmented control. Returns the clicked index.
+/// Segmented control; each option is a label and the family it's set in (the Font row shows
+/// "Serif" in Literata). Returns the clicked index.
 pub fn segmented(
     ui: &mut Ui,
     rect: Rect,
     id_salt: &str,
-    options: &[&str],
+    options: &[(&str, FontFamily)],
     selected: usize,
     p: &Palette,
 ) -> Option<usize> {
@@ -243,7 +287,7 @@ pub fn segmented(
     painter.rect_filled(rect, 8.0, track);
     let seg_w = (rect.width() - 4.0) / options.len() as f32;
     let mut clicked = None;
-    for (i, label) in options.iter().enumerate() {
+    for (i, (label, family)) in options.iter().enumerate() {
         let r = Rect::from_min_size(
             pos2(rect.left() + 2.0 + i as f32 * seg_w, rect.top() + 2.0),
             vec2(seg_w, rect.height() - 4.0),
@@ -263,7 +307,8 @@ pub fn segmented(
         } else {
             p.muted
         };
-        painter.text(r.center(), Align2::CENTER_CENTER, *label, font(13.0), color);
+        let font = FontId::new(13.0, family.clone());
+        painter.text(r.center(), Align2::CENTER_CENTER, *label, font, color);
         if resp.has_focus() {
             focus_ring(&painter, r, 6.0, p);
         }
@@ -278,7 +323,9 @@ pub fn segmented(
 pub fn switch(ui: &mut Ui, rect: Rect, id_salt: &str, on: bool, p: &Palette) -> Response {
     let id = ui.id().with(id_salt);
     let resp = ui.interact(rect, id, Sense::click());
-    let t = ui.ctx().animate_bool_with_time(id, on, 0.12);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(id, on, super::anim_secs(ui.ctx(), super::HOVER_SECS));
     let painter = ui.painter();
     let track = lerp(p.border_strong, p.accent, t);
     painter.rect_filled(rect, rect.height() / 2.0, track);

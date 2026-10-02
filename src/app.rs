@@ -19,12 +19,18 @@ use crate::reload::{FileWatcher, Stamp, WatchEvent};
 use crate::renderer::Renderer;
 use crate::settings::{self, DEFAULT_TEXT_SIZE, RecentEntry, SettingsStore, WindowGeom};
 use crate::theme;
-use crate::ui::{self, Action, OUTLINE_W, PANEL_SECS, Popover, Toast, UiState, outline};
+use crate::ui::{self, Action, BAR_H, OUTLINE_W, PANEL_SECS, Popover, Toast, UiState, outline};
 
 /// Set once a frame has been shown; `main` uses it to tell renderer-init failures apart.
 pub static FIRST_FRAME_SHOWN: AtomicBool = AtomicBool::new(false);
 
 const FIND_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Ctrl+F pre-fills the find input with a selection up to this long (single line only).
+const FIND_PREFILL_MAX: usize = 200;
+/// Wheel step per notch: 3 lines = 78 px (SPEC §7; the engine animates it).
+const WHEEL_LINE_PX: f32 = 78.0;
+/// Reading speed for "N min left" (SPEC §3).
+const WORDS_PER_MINUTE: usize = 230;
 
 /// The open document.
 pub struct Doc {
@@ -96,6 +102,11 @@ pub struct App {
     docked_fits: bool,
     bar: ui::app_bar::BarOut,
     demo_recents: Option<Vec<RecentEntry>>,
+    /// Windows "Show animations"; re-read whenever the window gains focus.
+    animations: bool,
+    /// `animations` as last applied to the egui style.
+    applied_animations: Option<bool>,
+    window_focused: bool,
 }
 
 impl App {
@@ -108,7 +119,11 @@ impl App {
         let ctx = &cc.egui_ctx;
         egui_extras::install_image_loaders(ctx);
         engine::fonts::install(ctx);
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        ctx.options_mut(|o| {
+            o.zoom_with_keyboard = false;
+            // egui-winit reports wheel notches in lines; the engine animates each step.
+            o.input_options.line_scroll_speed = WHEEL_LINE_PX;
+        });
         if let Some(ppp) = args.ppp {
             ctx.set_pixels_per_point(ppp);
         }
@@ -132,6 +147,9 @@ impl App {
             docked_fits: true,
             bar: Default::default(),
             demo_recents,
+            animations: platform::animations_enabled(),
+            applied_animations: None,
+            window_focused: true,
             args,
         };
         if !app.args.empty {
@@ -196,6 +214,11 @@ impl App {
         self.ui.outline_overlay = false;
         self.ui.hovered_link = None;
         self.out = DocOutput::default();
+        if self.ui.find.case_sensitive
+            && let Some(d) = self.doc.as_mut()
+        {
+            d.view.set_find_case_sensitive(true);
+        }
         self.rerun_find();
         if let (Some(a), Some(d)) = (anchor, self.doc.as_mut()) {
             d.view.scroll_to_anchor(&a);
@@ -325,14 +348,16 @@ impl App {
         match links::classify(target, links::probe) {
             LinkAction::Anchor(a) => self.jump_to_anchor(&a),
             LinkAction::OpenDoc { path, anchor } => {
-                if new_window {
-                    self.spawn_window(Some(&path), anchor.as_deref());
-                } else if self
+                let same_doc = self
                     .doc
                     .as_ref()
                     .and_then(Doc::path)
-                    .is_some_and(|p| settings::same_path(p, &path))
-                {
+                    .is_some_and(|p| settings::same_path(p, &path));
+                // Ctrl+click / middle-click opens a new window, except for a section of the
+                // document already shown here: that just navigates.
+                if new_window && !(same_doc && anchor.is_some()) {
+                    self.spawn_window(Some(&path), anchor.as_deref());
+                } else if same_doc {
                     match anchor {
                         Some(a) => self.jump_to_anchor(&a),
                         None => {
@@ -456,6 +481,56 @@ impl App {
         self.ui.find.status = st;
     }
 
+    /// Ctrl+F: open (or re-focus) find. A single-line selection becomes the query; the input's
+    /// text is selected either way (SPEC §7).
+    fn open_find(&mut self) {
+        let Some(d) = self.doc.as_ref() else { return };
+        let f = &mut self.ui.find;
+        match find_prefill(d.view.selected_text()) {
+            Some(t) if t != f.query => {
+                f.query = t;
+                f.edited_at = Some(Instant::now() - FIND_DEBOUNCE);
+            }
+            _ if !f.open && !f.query.is_empty() => {
+                f.edited_at = Some(Instant::now() - FIND_DEBOUNCE);
+            }
+            _ => {}
+        }
+        f.open = true;
+        f.focus = true;
+        self.ui.popover = None;
+    }
+
+    /// Close find. With `select_match` (Esc), the current match becomes the text selection.
+    fn close_find(&mut self, select_match: bool) {
+        if select_match && self.ui.find.sent != self.ui.find.query {
+            // Typed but not yet searched (debounce): search now so Esc selects what's shown.
+            self.send_find_query();
+        }
+        self.ui.find.open = false;
+        self.ui.find.edited_at = None;
+        self.ui.find.sent.clear();
+        self.ui.find.status = Default::default();
+        if let Some(d) = self.doc.as_mut() {
+            if select_match {
+                d.view.select_current_match();
+            }
+            d.view.clear_find();
+        }
+    }
+
+    fn toggle_find_case(&mut self) {
+        self.programmatic_at = Some(Instant::now());
+        let f = &mut self.ui.find;
+        f.case_sensitive = !f.case_sensitive;
+        if let Some(d) = self.doc.as_mut() {
+            let st = d.view.set_find_case_sensitive(f.case_sensitive);
+            if !f.sent.is_empty() {
+                f.status = st;
+            }
+        }
+    }
+
     // ---- actions ---------------------------------------------------------------------------
 
     fn apply(&mut self, ctx: &egui::Context, frame: &eframe::Frame, action: Action) {
@@ -466,7 +541,6 @@ impl App {
                 | Action::Forward
                 | Action::Link(..)
                 | Action::ScrollToHeading(_)
-                | Action::HeadingStep(_)
                 | Action::FindNext
                 | Action::FindPrev
         ) {
@@ -524,6 +598,18 @@ impl App {
                     self.toast(Toast::error(format!("Couldn't open an editor: {e}")));
                 }
             }
+            Action::OpenInEditorAt(line) => {
+                let Some(d) = self.doc.as_ref() else { return };
+                match d.path().map(Path::to_path_buf) {
+                    // Pasted text has no file to edit.
+                    None => self.toast(Toast::info("Pasted text has no file to open")),
+                    Some(p) => {
+                        if let Err(e) = platform::open_in_editor_at(&p, line) {
+                            self.toast(Toast::error(format!("Couldn't open an editor: {e}")));
+                        }
+                    }
+                }
+            }
             Action::Reveal => {
                 if let Some(p) = self.doc.as_ref().and_then(Doc::path).map(Path::to_path_buf)
                     && let Err(e) = platform::reveal(&p)
@@ -538,7 +624,6 @@ impl App {
                     d.view.scroll_to_heading(i);
                 }
             }
-            Action::HeadingStep(dir) => self.heading_step(dir),
             Action::ToggleOutline => {
                 let available = self.doc.as_ref().is_some_and(|d| d.outline_available);
                 if !available {
@@ -553,27 +638,12 @@ impl App {
                 }
             }
             Action::CloseOutlineOverlay => self.ui.outline_overlay = false,
-            Action::OpenFind => {
-                if self.doc.is_some() {
-                    let f = &mut self.ui.find;
-                    if !f.open && !f.query.is_empty() {
-                        f.edited_at = Some(Instant::now() - FIND_DEBOUNCE);
-                    }
-                    f.open = true;
-                    f.focus = true;
-                    self.ui.popover = None;
-                }
-            }
-            Action::CloseFind => {
-                self.ui.find.open = false;
-                self.ui.find.sent.clear();
-                self.ui.find.status = Default::default();
-                if let Some(d) = self.doc.as_mut() {
-                    d.view.clear_find();
-                }
-            }
+            Action::OpenFind => self.open_find(),
+            Action::CloseFind => self.close_find(false),
+            Action::EscapeFind => self.close_find(true),
             Action::FindNext => self.find_step(true),
             Action::FindPrev => self.find_step(false),
+            Action::ToggleFindCase => self.toggle_find_case(),
             Action::TogglePopover(p) => {
                 self.ui.popover = if self.ui.popover == Some(p) {
                     None
@@ -648,34 +718,11 @@ impl App {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
-    /// Ctrl+↑/↓: previous/next H1–H3 relative to the active section.
-    fn heading_step(&mut self, dir: i32) {
-        let active = self.out.active_heading;
-        let Some(d) = self.doc.as_mut() else { return };
-        let targets: Vec<usize> = d
-            .view
-            .document()
-            .headings()
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| h.level <= 3)
-            .map(|(i, _)| i)
-            .collect();
-        let next = match (dir > 0, active) {
-            (true, Some(a)) => targets.iter().copied().find(|&i| i > a),
-            (true, None) => targets.first().copied(),
-            (false, Some(a)) => targets.iter().copied().rev().find(|&i| i < a),
-            (false, None) => None,
-        };
-        match next {
-            Some(i) => d.view.scroll_to_heading(i),
-            None if dir < 0 => d.view.scroll_to_top(),
-            None => {}
-        }
-    }
-
     // ---- input -----------------------------------------------------------------------------
 
+    /// App-level keys, pointer buttons, wheel zoom, paste and drops. Runs before the document
+    /// is shown. Reading keys (arrows, PgUp/PgDn, Space, Home/End), Ctrl+↑/↓, Ctrl+A and Ctrl+C
+    /// belong to the engine: they're only observed here (for app bar auto-hide), never consumed.
     fn handle_input(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         let typing = ctx.egui_wants_keyboard_input();
@@ -772,12 +819,6 @@ impl App {
             }
             if key(ctrl, Key::Num0) {
                 actions.push(Action::SetTextSize(DEFAULT_TEXT_SIZE));
-            }
-            if has_doc && key(ctrl, Key::ArrowUp) {
-                actions.push(Action::HeadingStep(-1));
-            }
-            if has_doc && key(ctrl, Key::ArrowDown) {
-                actions.push(Action::HeadingStep(1));
             }
             if key(Modifiers::ALT, Key::ArrowLeft) {
                 actions.push(Action::Back);
@@ -881,14 +922,15 @@ impl App {
         actions
     }
 
-    /// Esc closes, in order: popover or menu → shortcut overlay → find → overlay outline → Zen.
+    /// Esc closes, in order: popover or menu → shortcut overlay → find (selecting the current
+    /// match) → overlay outline → Zen.
     fn escape_action(&self) -> Option<Action> {
         if self.ui.popover.is_some() {
             Some(Action::ClosePopover)
         } else if self.ui.shortcuts {
             Some(Action::ToggleShortcuts)
         } else if self.ui.find.open {
-            Some(Action::CloseFind)
+            Some(Action::EscapeFind)
         } else if self.ui.outline_overlay {
             Some(Action::CloseOutlineOverlay)
         } else if self.ui.zen {
@@ -901,13 +943,29 @@ impl App {
     // ---- per-frame helpers -----------------------------------------------------------------
 
     fn sync_theme(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // The OS animation setting can change while we run: re-read it when focus comes back.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+        if focused && !self.window_focused {
+            self.animations = platform::animations_enabled();
+        }
+        self.window_focused = focused;
+
         let pref = self.args.theme.unwrap_or(self.settings.data.theme);
         let kind = theme::resolve(pref, ctx.system_theme());
-        if self.theme != Some(kind) {
+        let theme_changed = self.theme != Some(kind);
+        if theme_changed || self.applied_animations != Some(self.animations) {
             self.theme = Some(kind);
+            self.applied_animations = Some(self.animations);
             self.palette = Palette::for_theme(kind);
-            theme::apply(ctx, kind, &self.palette);
-            platform::style_title_bar(frame, self.palette.bg, self.palette.text, kind.is_dark());
+            theme::apply(ctx, kind, &self.palette, self.animations);
+            if theme_changed {
+                platform::style_title_bar(
+                    frame,
+                    self.palette.bg,
+                    self.palette.text,
+                    kind.is_dark(),
+                );
+            }
         }
     }
 
@@ -1036,18 +1094,24 @@ impl App {
     }
 }
 
-/// "8 min left" (230 words per minute; "<1 min left" near the end). Until the engine reports
-/// `words_remaining`, estimate it from the total and the reading progress.
-fn time_left(out: &DocOutput, total_words: usize) -> String {
-    let words = if out.words_remaining > 0 || out.progress >= 0.999 {
-        out.words_remaining
-    } else {
-        (total_words as f32 * (1.0 - out.progress)).round() as usize
-    };
-    if words < 230 {
+/// The find query Ctrl+F takes from the selection: a single line of at most 200 characters.
+fn find_prefill(selection: Option<String>) -> Option<String> {
+    let text = selection?;
+    let text = text.trim_matches(['\n', '\r']);
+    let ok = !text.is_empty()
+        && !text.contains(['\n', '\r'])
+        && text.chars().count() <= FIND_PREFILL_MAX;
+    ok.then(|| text.to_owned())
+}
+
+/// "8 min left" from the engine's count of readable words below the viewport top (code
+/// excluded) at 230 words per minute; "<1 min left" near the end (SPEC §3).
+fn time_left(words_remaining: usize) -> String {
+    if words_remaining < WORDS_PER_MINUTE {
         "<1 min left".into()
     } else {
-        format!("{} min left", (words as f32 / 230.0).round() as usize)
+        let minutes = (words_remaining as f32 / WORDS_PER_MINUTE as f32).round();
+        format!("{minutes} min left")
     }
 }
 
@@ -1131,16 +1195,20 @@ impl eframe::App for App {
         }
         let docked_on = outline_ok && self.docked_fits && s.outline_open;
         let overlay_on = outline_ok && !self.docked_fits && self.ui.outline_overlay;
+        let panel_secs = ui::anim_secs(&ctx, PANEL_SECS);
         let docked_t =
-            ctx.animate_bool_with_time(Id::new("outline-docked-t"), docked_on, PANEL_SECS);
+            ctx.animate_bool_with_time(Id::new("outline-docked-t"), docked_on, panel_secs);
         let overlay_t =
-            ctx.animate_bool_with_time(Id::new("outline-overlay-t"), overlay_on, PANEL_SECS);
+            ctx.animate_bool_with_time(Id::new("outline-overlay-t"), overlay_on, panel_secs);
         let doc_rect = Rect::from_min_max(
             pos2(screen.left() + OUTLINE_W * docked_t, screen.top()),
             screen.max,
         );
         let measure = theme::measure(s.width, s.text_size, doc_rect.width());
-        let style = theme::engine_style(kind, s, measure);
+        // The app bar overlays the document; the engine pads its first block below it. This stays
+        // 44 while the bar auto-hides (content never jumps); Zen has no bar.
+        let top_inset = if self.ui.zen { 0.0 } else { BAR_H };
+        let style = theme::engine_style(kind, s, measure, top_inset);
 
         // Document (or empty state), then the docked outline beside it.
         let mut scroll_y = 0.0;
@@ -1150,18 +1218,23 @@ impl eframe::App for App {
             let out = doc.view.show(&mut child, &style);
             scroll_y = doc.view.scroll_offset();
             if let Some(t) = &out.clicked_link {
-                let new_window = ctx.input(|i| {
-                    i.modifiers.command || i.pointer.button_released(PointerButton::Middle)
-                });
-                actions.push(Action::Link(t.clone(), new_window));
+                // Ctrl+click and middle-click (reported by the engine) ask for a new window.
+                actions.push(Action::Link(t.clone(), out.link_new_window));
+            }
+            if let Some(line) = out.open_in_editor_line {
+                actions.push(Action::OpenInEditorAt(line));
             }
             if out.copied {
                 self.ui.toast = Some(Toast::info("Copied").with_icon(Icon::Check));
             }
+            if self.ui.find.open && !self.ui.find.sent.is_empty() {
+                // The engine's status is the truth (e.g. after a live reload re-ran the query).
+                self.ui.find.status = doc.view.find_status();
+            }
             let props = outline::OutlineProps {
                 entries: &doc.outline,
                 active: out.active_heading,
-                time_left: Some(time_left(&out, doc.view.document().word_count())),
+                time_left: Some(time_left(out.words_remaining)),
             };
             outline::show_docked(root, screen, docked_t, &props, &p, &mut actions);
             outline::show_overlay(&ctx, screen, overlay_t, &props, &p, &mut actions);
@@ -1197,8 +1270,12 @@ impl eframe::App for App {
         if !shown && pointer_y.is_some_and(|y| y <= 56.0) {
             ctx.request_repaint_after(Duration::from_millis(50)); // top-edge dwell
         }
-        let shown_t = ctx.animate_bool_with_time(Id::new("bar-shown"), shown, PANEL_SECS);
-        let border_t = ctx.animate_bool_with_time(Id::new("bar-border"), scroll_y > 0.0, 0.12);
+        let shown_t = ctx.animate_bool_with_time(Id::new("bar-shown"), shown, panel_secs);
+        let border_t = ctx.animate_bool_with_time(
+            Id::new("bar-border"),
+            scroll_y > 0.0,
+            ui::anim_secs(&ctx, ui::HOVER_SECS),
+        );
         let props = ui::app_bar::BarProps {
             has_doc,
             outline_available: outline_ok,
@@ -1344,5 +1421,35 @@ impl eframe::App for App {
 
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minutes_left_at_230_wpm() {
+        assert_eq!(time_left(0), "<1 min left");
+        assert_eq!(time_left(229), "<1 min left");
+        assert_eq!(time_left(230), "1 min left");
+        assert_eq!(time_left(1840), "8 min left");
+        assert_eq!(time_left(1900), "8 min left");
+    }
+
+    #[test]
+    fn ctrl_f_prefills_single_line_selections_only() {
+        let p = |s: &str| find_prefill(Some(s.to_owned()));
+        assert_eq!(p("rollback plan"), Some("rollback plan".into()));
+        assert_eq!(
+            p("word\n"),
+            Some("word".into()),
+            "a trailing line break is dropped"
+        );
+        assert_eq!(p("two\nlines"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(p(&"x".repeat(200)), Some("x".repeat(200)));
+        assert_eq!(p(&"x".repeat(201)), None);
+        assert_eq!(find_prefill(None), None);
     }
 }

@@ -24,12 +24,17 @@ impl Harness {
     }
 
     fn frame(&mut self, view: &mut DocView) -> DocOutput {
+        self.frame_with(view, Vec::new())
+    }
+
+    fn frame_with(&mut self, view: &mut DocView, events: Vec<egui::Event>) -> DocOutput {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(1100.0, 860.0),
             )),
             time: Some(self.frame as f64 / 60.0),
+            events,
             ..Default::default()
         };
         self.frame += 1;
@@ -110,6 +115,30 @@ fn end_reaches_the_bottom_of_a_long_doc() {
     assert_eq!(
         out.active_heading,
         Some(view.document().headings().len() - 1)
+    );
+}
+
+#[test]
+fn ctrl_down_steps_through_headings() {
+    let mut h = Harness::new();
+    let mut view = DocView::new(load("ai-report.md"));
+    h.settle(&mut view);
+    let ctrl_down = egui::Event::Key {
+        key: egui::Key::ArrowDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    let mut offsets = vec![view.scroll_offset()];
+    for _ in 0..3 {
+        h.frame_with(&mut view, vec![ctrl_down.clone()]);
+        h.settle(&mut view);
+        offsets.push(view.scroll_offset());
+    }
+    assert!(
+        offsets.windows(2).all(|w| w[1] > w[0] + 1.0),
+        "each Ctrl+Down moves to the next heading: {offsets:?}"
     );
 }
 

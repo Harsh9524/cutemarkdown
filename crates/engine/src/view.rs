@@ -55,7 +55,7 @@ struct AtlasWatch {
 impl AtlasWatch {
     /// Call at the start of `show`; returns the current atlas epoch.
     fn epoch(&mut self, ctx: &egui::Context) -> u64 {
-        let (fill, options) = ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.options().clone()));
+        let (fill, options) = ctx.fonts(|f| (f.font_atlas_fill_ratio(), *f.options()));
         let reset = self.last_fill.is_some_and(|last| fill + 1e-6 < last)
             || self.last_options.as_ref().is_some_and(|o| *o != options);
         if reset {
@@ -1075,7 +1075,11 @@ impl ViewState {
     }
 
     fn jump_heading(&mut self, doc: &Document, forward: bool) {
-        let y = self.reading_y(self.scroll_y) + 24.0 - 16.0;
+        // A jump lands its heading 24 pt below the bar (`scroll_to_named`): measure from there,
+        // and from where an in-flight jump will land, so repeated presses keep stepping instead
+        // of finding the heading they just jumped to.
+        let scroll = self.anim.map_or(self.scroll_y, |a| a.to);
+        let y = self.reading_y(scroll) + 24.0;
         let list: Vec<(usize, f32)> = doc
             .p
             .headings

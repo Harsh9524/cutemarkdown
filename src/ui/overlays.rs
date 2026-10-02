@@ -62,14 +62,14 @@ pub fn drag_overlay(ctx: &egui::Context, screen: Rect, p: &Palette) {
                 c + vec2(0.0, 16.0),
                 Align2::CENTER_TOP,
                 "Drop to open",
-                font(16.0),
+                widgets::semibold(16.0),
                 p.link,
             );
             ui.allocate_rect(screen, Sense::hover());
         });
 }
 
-const SHORTCUTS: [(&str, &str); 21] = [
+const SHORTCUTS: [(&str, &str); 22] = [
     ("Open file", "Ctrl+O"),
     ("New window", "Ctrl+N"),
     ("Close window", "Ctrl+W"),
@@ -77,8 +77,8 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("Next / previous match", "Enter / Shift+Enter"),
     ("Close popover, find, outline, Zen", "Esc"),
     ("Text size", "Ctrl+= / Ctrl+− / Ctrl+0"),
-    ("Back / Forward", "Alt+Left / Alt+Right"),
-    ("Previous / next heading", "Ctrl+Up / Ctrl+Down"),
+    ("Back / Forward", "Alt+← / Alt+→"),
+    ("Previous / next heading", "Ctrl+↑ / Ctrl+↓"),
     ("Scroll a page", "PgUp / PgDn / Space"),
     ("Top / bottom", "Home / End"),
     ("Reload", "Ctrl+R / F5"),
@@ -88,6 +88,7 @@ const SHORTCUTS: [(&str, &str); 21] = [
     ("Reading settings", "Ctrl+,"),
     ("Open in editor", "Ctrl+E"),
     ("Reveal in Explorer", "Ctrl+Shift+E"),
+    ("Copy selection / select all", "Ctrl+C / Ctrl+A"),
     ("Copy Markdown source", "Ctrl+Shift+C"),
     ("Paste Markdown", "Ctrl+V"),
     ("Keyboard shortcuts", "Ctrl+/"),
@@ -122,7 +123,7 @@ pub fn shortcuts(ctx: &egui::Context, screen: Rect, p: &Palette, actions: &mut V
                 pos2(card.left() + PAD, card.top() + PAD + 10.0),
                 Align2::LEFT_CENTER,
                 "Keyboard shortcuts",
-                font(15.0),
+                widgets::semibold(15.0),
                 p.text_strong,
             );
             let close = Rect::from_center_size(
@@ -149,7 +150,7 @@ pub fn shortcuts(ctx: &egui::Context, screen: Rect, p: &Palette, actions: &mut V
                 // Keys as keycaps, right-aligned in the column.
                 let mut right = x + COL_W;
                 for part in keys.split(" / ").collect::<Vec<_>>().into_iter().rev() {
-                    let w = keycap_width(&body, part);
+                    let w = widgets::keycap_width(&body, part, 13.0);
                     right -= w;
                     widgets::keycap(&body, pos2(right, y), part, 13.0, p);
                     right -= 6.0;
@@ -159,11 +160,4 @@ pub fn shortcuts(ctx: &egui::Context, screen: Rect, p: &Palette, actions: &mut V
                 actions.push(Action::ToggleShortcuts);
             }
         });
-}
-
-fn keycap_width(painter: &egui::Painter, label: &str) -> f32 {
-    widgets::galley(painter, label, 13.0 * 0.86, egui::Color32::WHITE, None)
-        .size()
-        .x
-        + 12.0
 }

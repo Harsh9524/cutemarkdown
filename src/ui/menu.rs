@@ -10,7 +10,10 @@ use super::{Action, BAR_H};
 use crate::icons::{self, Icon};
 use crate::settings::{RECENT_SHOWN, RecentEntry};
 
-const W: f32 = 256.0;
+/// Minimum menu width; it grows to fit its widest label + shortcut.
+const MIN_W: f32 = 256.0;
+/// Space between a label and its right-aligned shortcut.
+const SHORTCUT_GAP: f32 = 24.0;
 const PAD: f32 = 6.0;
 const ITEM_H: f32 = 30.0;
 const SEP_H: f32 = 13.0;
@@ -120,8 +123,21 @@ pub fn show(
         .sum();
     let footer = props.words.map(footer_text);
     let h = 2.0 * PAD + content_h + if footer.is_some() { FOOTER_H } else { 0.0 };
-    let x = (anchor.right() - W).max(screen.left() + 8.0);
-    let rect = Rect::from_min_size(pos2(x, screen.top() + BAR_H + 4.0), vec2(W, h));
+    let measure = ctx.layer_painter(egui::LayerId::new(Order::Foreground, Id::new("more-menu")));
+    let text_w =
+        |text: &str, size: f32| widgets::galley(&measure, text, size, p.text, None).size().x;
+    let widest = items
+        .iter()
+        .map(|i| match i {
+            Item::Cmd {
+                label, shortcut, ..
+            } => text_w(label, 13.5) + shortcut.map_or(0.0, |s| SHORTCUT_GAP + text_w(s, 12.0)),
+            _ => 0.0,
+        })
+        .fold(0.0, f32::max);
+    let w = (widest + 20.0 + 2.0 * PAD).ceil().max(MIN_W);
+    let x = (anchor.right() - w).max(screen.left() + 8.0);
+    let rect = Rect::from_min_size(pos2(x, screen.top() + BAR_H + 4.0), vec2(w, h));
     let sub_id = Id::new("menu-recent-open");
     let mut sub_open =
         props.force_recent || ctx.data(|d| d.get_temp::<bool>(sub_id).unwrap_or(false));
@@ -137,7 +153,7 @@ pub fn show(
             let mut y = rect.top() + PAD;
             for (i, item) in items.into_iter().enumerate() {
                 let row =
-                    Rect::from_min_size(pos2(rect.left() + PAD, y), vec2(W - 2.0 * PAD, ITEM_H));
+                    Rect::from_min_size(pos2(rect.left() + PAD, y), vec2(w - 2.0 * PAD, ITEM_H));
                 match item {
                     Item::Sep => {
                         ui.painter().hline(
