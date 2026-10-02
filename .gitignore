@@ -2,3 +2,4 @@
 /dist
 *.png.tmp
 __pycache__/
+.claude/worktrees/
