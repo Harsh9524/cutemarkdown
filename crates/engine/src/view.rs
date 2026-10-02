@@ -101,6 +101,8 @@ struct Hit {
     rect: Rect,
     clip: Rect,
     galley: Arc<Galley>,
+    /// Char index of the galley start within the run.
+    base: usize,
     /// Top-level block and path to the item (for link lookup).
     block: usize,
     item: ItemPath,
@@ -137,6 +139,14 @@ pub(crate) struct ViewState {
     /// Keep the view pinned to the end (End key, scroll_to_bottom, follow-tail) until the
     /// reader scrolls away; survives heights changing during progressive layout.
     stick_bottom: bool,
+    /// Animations off (the shell set `Style::animation_time` to 0, e.g. Windows setting).
+    reduce_motion: bool,
+    /// Bumped whenever block heights/positions change.
+    layout_gen: u64,
+    /// Bumped whenever find results change.
+    find_gen: u64,
+    /// Document y of every find match, for the scrollbar ticks: (layout_gen, find_gen, ys).
+    tick_cache: (u64, u64, Vec<f32>),
     viewport_h: f32,
     top_inset: f32,
     hscroll: HashMap<u64, f32>,
@@ -152,6 +162,12 @@ pub(crate) struct ViewState {
     sb: Scrollbar,
     fallbacks_requested: bool,
     hovered_link_since: Option<(String, f64)>,
+    /// Footnote hover card: (footnote name, pointer position) requested this frame.
+    card_request: Option<(String, Pos2)>,
+    /// Laid-out card content: (footnote name, layout key, content).
+    card_cache: Option<(String, LayoutKey, Arc<LBlock>)>,
+    /// What the context menu was opened on.
+    menu_target: MenuTarget,
     /// Measured cost of the last `show` (for benchmarks).
     pub last_show_secs: f64,
     pub layout_complete: bool,
@@ -174,6 +190,10 @@ impl ViewState {
             pending: None,
             anim: None,
             stick_bottom: false,
+            reduce_motion: false,
+            layout_gen: 0,
+            find_gen: 0,
+            tick_cache: (u64::MAX, u64::MAX, Vec::new()),
             viewport_h: 600.0,
             top_inset: 0.0,
             hscroll: HashMap::new(),
@@ -192,6 +212,9 @@ impl ViewState {
             },
             fallbacks_requested: false,
             hovered_link_since: None,
+            card_request: None,
+            card_cache: None,
+            menu_target: MenuTarget::default(),
             last_show_secs: 0.0,
             layout_complete: false,
         };
@@ -385,6 +408,7 @@ impl ViewState {
             }
         }
         if changed || self.tops_dirty {
+            self.layout_gen += 1;
             self.recompute_tops(doc);
             self.restore(anchor);
         }
@@ -500,6 +524,7 @@ impl ViewState {
         self.find.case_sensitive = case_sensitive;
         let texts = doc.search_texts();
         self.find.matches = find::find_all(texts, query, case_sensitive);
+        self.find_gen += 1;
         self.find.current = None;
         if self.find.matches.is_empty() {
             return self.find_status();
@@ -713,6 +738,7 @@ impl ViewState {
             }
         }
         let font_gen = crate::fonts::generation();
+        self.reduce_motion = ui.style().animation_time <= 0.0;
 
         // Geometry.
         let inset = style.top_inset.max(0.0);
@@ -802,6 +828,7 @@ impl ViewState {
         let (a, b) = self.visible_range(0.0);
         let hits = self.collect_hits(doc, rect, col_left, content_origin_y, a, b);
         self.handle_pointer(doc, ui, &resp, rect, &hits, &mut out, now);
+        self.context_menu(doc, ui, &resp, rect, &hits, &mut out);
         let actions = self.paint(
             doc,
             ui,
@@ -835,7 +862,8 @@ impl ViewState {
                 }
             }
         }
-        self.paint_scrollbar(ui, rect, pal, now);
+        self.paint_scrollbar(doc, ui, rect, pal, now);
+        self.paint_footnote_card(doc, ui, rect, style, now);
 
         // 6. Outputs.
         self.outputs(doc, &mut out);
@@ -1024,11 +1052,17 @@ impl ViewState {
         }
     }
 
+    /// Animated scroll (ease-out cubic). Long jumps (> 3 viewports) first jump to one
+    /// viewport short of the target; with animations off (`animation_time == 0`), jump.
     fn animate_to(&mut self, to: f32, now: f64, dur: f32) {
-        if (to - self.scroll_y).abs() < 0.5 {
+        if self.reduce_motion || (to - self.scroll_y).abs() < 0.5 {
             self.anim = None;
             self.scroll_y = to;
             return;
+        }
+        let dist = to - self.scroll_y;
+        if dist.abs() > 3.0 * self.viewport_h {
+            self.scroll_y = to - dist.signum() * self.viewport_h;
         }
         self.anim = Some(Anim {
             from: self.scroll_y,
@@ -1178,11 +1212,14 @@ impl ViewState {
                 }
                 Item::Scroll(s) => {
                     for inner in &s.items {
+                        // Code split per line (wrap mode): the last piece starting at/before it.
                         if let Item::Text(t) = inner
                             && t.run == mt.run
+                            && t.char_base <= mt.start as usize
                         {
                             let starts = layout::row_starts(&t.galley);
-                            let r = layout::char_rect(&t.galley, &starts, mt.start as usize);
+                            let local = mt.start as usize - t.char_base;
+                            let r = layout::char_rect(&t.galley, &starts, local);
                             let x = t.pos.x + r.left();
                             found = Some((t.pos.y + r.top(), Some((s.id, x, s.frame.width()))));
                         }
@@ -1261,22 +1298,68 @@ impl ViewState {
                 words += *w as usize;
             }
             out.words_remaining = words;
-            out.top_source_line = self.source_line_at(doc, i, vis_top - self.tops[i]);
+            // In the gap after a block, the next block is the top visible one.
+            let off = vis_top - self.tops[i];
+            out.top_source_line = if off >= self.slots[i].h && i + 1 < n {
+                self.source_line_at(doc, i + 1, 0.0)
+            } else {
+                self.source_line_at(doc, i, off)
+            };
         }
     }
 
     /// Best-effort source line at an offset inside a top-level block.
+    /// Source line at an offset inside a top-level block: the line of the first text item
+    /// whose bottom is below `off` (plus the row inside code blocks).
     fn source_line_at(&self, doc: &Document, i: usize, off: f32) -> usize {
         let b = &doc.p.blocks[i];
-        let mut line = b.line as usize;
+        let fallback = b.line.max(1) as usize;
         if off <= 0.0 {
-            return line.max(1);
+            return fallback;
         }
-        // Nested blocks (list items, quotes…) have their own lines: pick by proportion.
-        let h = self.slots[i].h.max(1.0);
-        let span = b.end_line.saturating_sub(b.line) as f32;
-        line += ((off / h).clamp(0.0, 1.0) * span) as usize;
-        line.max(1)
+        let Some(lb) = self.slots[i].lb.as_ref() else {
+            // Not laid out yet: estimate by proportion.
+            let h = self.slots[i].h.max(1.0);
+            let span = b.end_line.saturating_sub(b.line) as f32;
+            return fallback + ((off / h).clamp(0.0, 1.0) * span) as usize;
+        };
+        let mut best: Option<(f32, usize)> = None;
+        let mut consider = |t: &TextItem| {
+            let r = t.rect();
+            if r.bottom() <= off || best.is_some_and(|(top, _)| top <= r.top()) {
+                return;
+            }
+            let info = &doc.p.runs[t.run as usize];
+            let mut line = info.line as usize;
+            if info.kind == RunKind::Code {
+                // Fenced code starts one line below its fence; wrapped code is split per line.
+                let text = &doc.p.texts[t.run as usize].text;
+                let before = text
+                    .chars()
+                    .take(t.char_base)
+                    .filter(|&c| c == '\n')
+                    .count();
+                let rows = if off > r.top() && t.char_base == 0 {
+                    ((off - r.top()) / t.line_h.max(1.0)) as usize
+                } else {
+                    0
+                };
+                line += 1 + before + rows;
+            }
+            best = Some((r.top(), line));
+        };
+        for it in &lb.items {
+            match it {
+                Item::Text(t) => consider(t),
+                Item::Scroll(s) => s.items.iter().for_each(|x| {
+                    if let Item::Text(t) = x {
+                        consider(t)
+                    }
+                }),
+                _ => {}
+            }
+        }
+        best.map_or(fallback, |(_, l)| l.max(1))
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1307,6 +1390,7 @@ impl ViewState {
                             rect: t.galley.rect.translate(o.to_vec2()),
                             clip: rect,
                             galley: t.galley.clone(),
+                            base: t.char_base,
                             block: i,
                             item: ItemPath {
                                 index: idx,
@@ -1327,6 +1411,7 @@ impl ViewState {
                                     rect: t.galley.rect.translate(o.to_vec2()).intersect(frame),
                                     clip: frame.intersect(rect),
                                     galley: t.galley.clone(),
+                                    base: t.char_base,
                                     block: i,
                                     item: ItemPath {
                                         index: idx,
@@ -1356,7 +1441,7 @@ impl ViewState {
                 let c = h.galley.cursor_from_pos(p - h.origin);
                 return Some(SelPos {
                     run: h.run,
-                    ch: c.index.0 as u32,
+                    ch: (h.base + c.index.0) as u32,
                 });
             }
         }
@@ -1373,7 +1458,7 @@ impl ViewState {
             let c = h.galley.cursor_from_pos(p - h.origin);
             return Some(SelPos {
                 run: h.run,
-                ch: c.index.0 as u32,
+                ch: (h.base + c.index.0) as u32,
             });
         }
         // Between blocks: end of the last item above, else start of the first below.
@@ -1384,12 +1469,15 @@ impl ViewState {
         if let Some(h) = above {
             return Some(SelPos {
                 run: h.run,
-                ch: h.galley.end().index.0 as u32,
+                ch: (h.base + h.galley.end().index.0) as u32,
             });
         }
         hits.iter()
             .min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
-            .map(|h| SelPos { run: h.run, ch: 0 })
+            .map(|h| SelPos {
+                run: h.run,
+                ch: h.base as u32,
+            })
     }
 
     fn link_at(&self, doc: &Document, hits: &[Hit], p: Pos2) -> Option<(RunId, u32)> {
@@ -1489,12 +1577,24 @@ impl ViewState {
                 .and_then(|(run, li)| doc.p.texts[run as usize].links.get(li as usize).cloned())
                 .or_else(|| self.image_link_at(rect, p))
         });
+        self.card_request = None;
         if let Some(link) = link {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
             out.hovered_link = Some(link.href.clone());
             match &self.hovered_link_since {
                 Some((h, _)) if *h == link.href => {}
                 _ => self.hovered_link_since = Some((link.href.clone(), now)),
+            }
+            // Footnote references preview their note after 250 ms.
+            if let LinkDest::Anchor(a) = &link.dest
+                && let Some(name) = a.strip_prefix("fn-")
+                && let (Some((_, t0)), Some(p)) = (&self.hovered_link_since, pointer)
+            {
+                if now - t0 >= 0.25 {
+                    self.card_request = Some((name.to_owned(), p));
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                }
             }
             let middle = resp.clicked_by(PointerButton::Middle);
             if (resp.clicked() && !shift) || middle {
@@ -1822,6 +1922,52 @@ impl ViewState {
                 }
                 let max = s.content_w - s.frame.width();
                 if max > 0.5 {
+                    // 16 px fades mark each clipped edge (SPEC §6), per band for tables.
+                    let fade = |p: &Painter, r: Rect, left_opaque: bool| {
+                        let whole = [(s.frame.top(), s.frame.bottom(), s.fade)];
+                        let bands: &[(f32, f32, Color32)] = if s.fade_bands.is_empty() {
+                            &whole
+                        } else {
+                            &s.fade_bands
+                        };
+                        for &(y0, y1, color) in bands {
+                            let band = Rect::from_min_max(
+                                pos2(r.left(), (origin.y + y0).max(r.top())),
+                                pos2(r.right(), (origin.y + y1).min(r.bottom())),
+                            );
+                            if !band.is_positive() {
+                                continue;
+                            }
+                            let (a, b) = if left_opaque {
+                                (color, Color32::TRANSPARENT)
+                            } else {
+                                (Color32::TRANSPARENT, color)
+                            };
+                            let mut mesh = egui::Mesh::default();
+                            mesh.colored_vertex(band.left_top(), a);
+                            mesh.colored_vertex(band.right_top(), b);
+                            mesh.colored_vertex(band.right_bottom(), b);
+                            mesh.colored_vertex(band.left_bottom(), a);
+                            mesh.add_triangle(0, 1, 2);
+                            mesh.add_triangle(0, 2, 3);
+                            p.add(Shape::mesh(mesh));
+                        }
+                    };
+                    let fw = 16.0;
+                    if off > 0.5 {
+                        let r = Rect::from_min_max(
+                            frame.left_top(),
+                            pos2(frame.left() + fw, frame.bottom()),
+                        );
+                        fade(&p2, r, true);
+                    }
+                    if off < max - 0.5 {
+                        let r = Rect::from_min_max(
+                            pos2(frame.right() - fw, frame.top()),
+                            frame.right_bottom(),
+                        );
+                        fade(&p2, r, false);
+                    }
                     // Horizontal thumb on hover.
                     let hovered = ui.rect_contains_pointer(frame);
                     let id = self.id.with(("hthumb", s.id));
@@ -1877,7 +2023,18 @@ impl ViewState {
             .iter()
             .map(|r| r.char_count_including_newline().0)
             .sum::<usize>();
-        let sel = self.sel_range(t.run, n_chars);
+        // Run char ranges → this galley's chars (code may be split into one galley per line).
+        let base = t.char_base;
+        let local = |s: usize, e: usize| {
+            let (s, e) = (
+                s.saturating_sub(base).min(n_chars),
+                e.saturating_sub(base).min(n_chars),
+            );
+            (e > s).then_some(s..e)
+        };
+        let sel = self
+            .sel_range(t.run, usize::MAX)
+            .and_then(|r| local(r.start, r.end));
         let lo = matches.partition_point(|m| m.run < t.run);
         let hi = matches.partition_point(|m| m.run <= t.run);
         if sel.is_some() || lo < hi {
@@ -1900,7 +2057,10 @@ impl ViewState {
             }
             for (mi, m) in matches[lo..hi].iter().enumerate() {
                 let current = self.find.current == Some(lo + mi);
-                for (ri, x0, x1) in layout::segments(g, &starts, m.start as usize..m.end as usize) {
+                let Some(range) = local(m.start as usize, m.end as usize) else {
+                    continue;
+                };
+                for (ri, x0, x1) in layout::segments(g, &starts, range) {
                     let (top, bottom) = line_box(ri);
                     let r =
                         Rect::from_min_max(pos2(x0 - 1.0, top + 2.0), pos2(x1 + 1.0, bottom - 2.0))
@@ -1933,7 +2093,8 @@ impl ViewState {
         {
             let m = matches[cur];
             let starts = layout::row_starts(g);
-            for (ri, x0, x1) in layout::segments(g, &starts, m.start as usize..m.end as usize) {
+            let range = local(m.start as usize, m.end as usize).unwrap_or(0..0);
+            for (ri, x0, x1) in layout::segments(g, &starts, range) {
                 let row = &g.rows[ri];
                 let r = Rect::from_min_max(pos2(x0, row.pos.y), pos2(x1, row.pos.y + row.size.y))
                     .translate(gv);
@@ -2061,7 +2222,14 @@ impl ViewState {
         }
     }
 
-    fn paint_scrollbar(&mut self, ui: &Ui, rect: Rect, pal: &crate::Palette, now: f64) {
+    fn paint_scrollbar(
+        &mut self,
+        doc: &Document,
+        ui: &Ui,
+        rect: Rect,
+        pal: &crate::Palette,
+        now: f64,
+    ) {
         let max = self.max_scroll();
         if max <= 0.0 {
             return;
@@ -2146,6 +2314,24 @@ impl ViewState {
         } else {
             0.22
         };
+        // Find matches: 2 px `find-current` ticks across the track (always shown while finding).
+        if !self.find.matches.is_empty() {
+            let pad = self.top_pad();
+            let ys = self.find_ticks(doc);
+            let mut last = f32::NEG_INFINITY;
+            for &y in ys {
+                let ty = (track.top() + (pad + y) / total * track.height()).round();
+                if ty - last < 2.0 {
+                    continue;
+                }
+                last = ty;
+                let r = Rect::from_min_max(
+                    pos2(zone.left() + 2.0, ty),
+                    pos2(zone.right() - 1.0, ty + 2.0),
+                );
+                ui.painter().rect_filled(r, 0.0, pal.find_current);
+            }
+        }
         if alpha > 0.0 {
             let thumb =
                 Rect::from_min_size(pos2(rect.right() - 2.0 - w, thumb_y), vec2(w, thumb_h));
@@ -2156,6 +2342,43 @@ impl ViewState {
             );
         }
     }
+
+    /// Document y of each find match (block top + the run's text item, once laid out).
+    fn find_ticks(&mut self, doc: &Document) -> &[f32] {
+        if self.tick_cache.0 != self.layout_gen || self.tick_cache.1 != self.find_gen {
+            let mut ys = Vec::with_capacity(self.find.matches.len());
+            let mut cache_block = usize::MAX;
+            let mut run_y: HashMap<RunId, f32> = HashMap::new();
+            for m in &self.find.matches {
+                let top = doc.p.runs[m.run as usize].top as usize;
+                if top != cache_block {
+                    cache_block = top;
+                    run_y.clear();
+                    if let Some(lb) = self.slots.get(top).and_then(|s| s.lb.as_ref()) {
+                        for it in &lb.items {
+                            match it {
+                                Item::Text(t) => {
+                                    run_y.entry(t.run).or_insert(t.pos.y);
+                                }
+                                Item::Scroll(s) => {
+                                    for x in &s.items {
+                                        if let Item::Text(t) = x {
+                                            run_y.entry(t.run).or_insert(t.pos.y);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let base = self.tops.get(top).copied().unwrap_or(0.0);
+                ys.push(base + run_y.get(&m.run).copied().unwrap_or(0.0));
+            }
+            self.tick_cache = (self.layout_gen, self.find_gen, ys);
+        }
+        &self.tick_cache.2
+    }
 }
 
 /// Public scroll requests.
@@ -2164,6 +2387,259 @@ pub(crate) enum ScrollReqPub {
     Bottom,
     Anchor(String),
     Heading(usize),
+}
+
+/// What a right-click landed on.
+#[derive(Clone, Debug, Default)]
+struct MenuTarget {
+    heading: Option<usize>,
+    link: Option<Link>,
+    /// (loader URI, source as written)
+    image: Option<(String, String)>,
+}
+
+enum MenuAction {
+    Copy(String),
+    CopyImage(String),
+    SelectAll,
+    Editor(usize),
+    Open(LinkTarget),
+}
+
+impl ViewState {
+    fn image_at(&self, rect: Rect, hits: &[Hit], p: Pos2) -> Option<(String, String)> {
+        let col_left = (rect.left() + (rect.width() - self.col_w) / 2.0).round();
+        let oy = rect.top() + self.top_pad() - self.scroll_y;
+        let (a, b) = self.visible_range(0.0);
+        for i in a..b {
+            let Some(lb) = &self.slots[i].lb else {
+                continue;
+            };
+            for it in &lb.items {
+                if let Item::Image {
+                    rect: r, uri, src, ..
+                } = it
+                    && r.translate(vec2(col_left, oy + self.tops[i])).contains(p)
+                {
+                    return Some((uri.clone(), src.clone()));
+                }
+            }
+        }
+        for h in hits {
+            let Some(t) = self.text_item(h) else { continue };
+            for o in &t.objects {
+                if let ObjKind::Image { uri } = &o.kind
+                    && o.rect.translate(h.origin.to_vec2()).contains(p)
+                {
+                    return Some((uri.clone(), uri.trim_start_matches("file://").to_owned()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Context menu: Copy / Select all, plus link, image and heading items (SPEC §6, §7).
+    fn context_menu(
+        &mut self,
+        doc: &Document,
+        ui: &Ui,
+        resp: &egui::Response,
+        rect: Rect,
+        hits: &[Hit],
+        out: &mut DocOutput,
+    ) {
+        if resp.secondary_clicked()
+            && let Some(p) = ui.ctx().pointer_interact_pos()
+        {
+            let heading = hits
+                .iter()
+                .find(|h| h.rect.contains(p))
+                .and_then(|h| doc.p.heading_meta.iter().position(|m| m.run == h.run));
+            let link = self
+                .link_at(doc, hits, p)
+                .and_then(|(run, li)| doc.p.texts[run as usize].links.get(li as usize).cloned())
+                .or_else(|| self.image_link_at(rect, p));
+            self.menu_target = MenuTarget {
+                heading,
+                link,
+                image: self.image_at(rect, hits, p),
+            };
+        }
+        let target = self.menu_target.clone();
+        let has_sel = self.has_selection();
+        let mut actions: Vec<MenuAction> = Vec::new();
+        resp.context_menu(|ui| {
+            ui.set_min_width(200.0);
+            if ui.add_enabled(has_sel, egui::Button::new("Copy")).clicked() {
+                actions.push(MenuAction::Copy(self.selected_text(doc)));
+                ui.close();
+            }
+            if ui.button("Select all").clicked() {
+                actions.push(MenuAction::SelectAll);
+                ui.close();
+            }
+            if let Some(link) = &target.link {
+                ui.separator();
+                if ui.button("Copy link").clicked() {
+                    actions.push(MenuAction::Copy(link.href.clone()));
+                    ui.close();
+                }
+            }
+            if let Some((uri, src)) = &target.image {
+                ui.separator();
+                if ui.button("Copy image").clicked() {
+                    actions.push(MenuAction::CopyImage(uri.clone()));
+                    ui.close();
+                }
+                if ui.button("Copy image address").clicked() {
+                    actions.push(MenuAction::Copy(src.clone()));
+                    ui.close();
+                }
+                if ui.button("Open image").clicked() {
+                    let t = match uri.strip_prefix("file://") {
+                        Some(path) => LinkTarget::File {
+                            path: path.into(),
+                            anchor: None,
+                        },
+                        None => LinkTarget::External(uri.clone()),
+                    };
+                    actions.push(MenuAction::Open(t));
+                    ui.close();
+                }
+            }
+            if let Some(h) = target.heading {
+                ui.separator();
+                if ui.button("Copy section as Markdown").clicked() {
+                    actions.push(MenuAction::Copy(
+                        doc.section_markdown(h).unwrap_or_default(),
+                    ));
+                    ui.close();
+                }
+                if ui.button("Copy link to section").clicked() {
+                    actions.push(MenuAction::Copy(format!("#{}", doc.p.headings[h].anchor)));
+                    ui.close();
+                }
+                if ui.button("Open in editor here").clicked() {
+                    actions.push(MenuAction::Editor(doc.p.heading_meta[h].line as usize));
+                    ui.close();
+                }
+            }
+        });
+        for a in actions {
+            match a {
+                MenuAction::Copy(text) => {
+                    if !text.is_empty() {
+                        ui.ctx().copy_text(text);
+                        out.copied = true;
+                    }
+                }
+                MenuAction::CopyImage(uri) => {
+                    if let Ok(egui::load::ImagePoll::Ready { image }) = ui
+                        .ctx()
+                        .try_load_image(&uri, egui::load::SizeHint::default())
+                    {
+                        ui.ctx().copy_image((*image).clone());
+                        out.copied = true;
+                    }
+                }
+                MenuAction::SelectAll => self.select_all(doc),
+                MenuAction::Editor(line) => out.open_in_editor_line = Some(line),
+                MenuAction::Open(t) => out.clicked_link = Some(t),
+            }
+        }
+    }
+
+    /// The footnote hover card (SPEC §6): `surface`, radius 8, shadow, max 360 wide,
+    /// padding 10×12, the note at 14 px.
+    fn paint_footnote_card(
+        &mut self,
+        doc: &Document,
+        ui: &Ui,
+        rect: Rect,
+        style: &Style,
+        now: f64,
+    ) {
+        let Some((name, p)) = self.card_request.clone() else {
+            return;
+        };
+        let Some(key) = self.key else { return };
+        let Some(BlockKind::Footnotes(notes)) = doc.p.blocks.last().map(|b| &b.kind) else {
+            return;
+        };
+        let Some(note) = notes.iter().find(|n| n.name == name) else {
+            return;
+        };
+        let pal = &style.palette;
+        let (pad_x, pad_y) = (12.0, 10.0);
+        let card_w = 360.0f32.min(rect.width() - 16.0).max(120.0);
+        let lb = match &self.card_cache {
+            Some((n, k, lb)) if *n == name && *k == key => lb.clone(),
+            _ => {
+                let env = Self::env(doc, ui.ctx(), style, &self.images, &self.toggled);
+                let lb = Arc::new(layout::layout_note(
+                    &env,
+                    &note.blocks,
+                    card_w - 2.0 * pad_x,
+                ));
+                self.card_cache = Some((name.clone(), key, lb.clone()));
+                lb
+            }
+        };
+        // Shrink-wrap narrow notes.
+        let content_w = lb
+            .items
+            .iter()
+            .map(|it| match it {
+                Item::Text(t) => t.rect().right(),
+                _ => 0.0,
+            })
+            .fold(0.0, f32::max);
+        let w = (content_w + 2.0 * pad_x).clamp(80.0, card_w);
+        let h = lb.height + 2.0 * pad_y;
+        let mut x = (p.x - 24.0).clamp(rect.left() + 8.0, rect.right() - w - 8.0);
+        let mut y = p.y + 18.0;
+        if y + h > rect.bottom() - 8.0 {
+            y = p.y - 14.0 - h;
+        }
+        x = x.round();
+        y = y.round().max(rect.top() + 4.0);
+        let card = Rect::from_min_size(pos2(x, y), vec2(w, h));
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 8],
+            blur: 24,
+            spread: 0,
+            color: pal.shadow,
+        };
+        let id = self.id.with("fn-card");
+        egui::Area::new(id)
+            .order(egui::Order::Tooltip)
+            .fixed_pos(card.min)
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                let painter = ui.painter().clone();
+                painter.add(shadow.as_shape(card, 8));
+                painter.rect_filled(card, 8.0, pal.surface);
+                painter.rect_stroke(card, 8.0, Stroke::new(1.0, pal.border), StrokeKind::Inside);
+                let origin = vec2(card.left() + pad_x, card.top() + pad_y);
+                let mut actions = Vec::new();
+                for item in &lb.items {
+                    self.paint_item(
+                        doc,
+                        ui,
+                        &painter,
+                        item,
+                        origin,
+                        card,
+                        style,
+                        &[],
+                        None,
+                        now,
+                        &mut actions,
+                    );
+                }
+                ui.allocate_rect(card, Sense::hover());
+            });
+    }
 }
 
 /// Paint an image through egui's loaders (handles animated GIF frames and SVG rasterizing at

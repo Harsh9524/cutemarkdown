@@ -150,6 +150,8 @@ pub struct DocOutput {
     pub scrollable: bool,
     /// The link in `clicked_link` was Ctrl+clicked or middle-clicked: open it in a new window.
     pub link_new_window: bool,
+    /// "Open in editor here" was chosen in a heading's context menu: 1-based source line.
+    pub open_in_editor_line: Option<usize>,
 }
 
 /// Result of a find operation.

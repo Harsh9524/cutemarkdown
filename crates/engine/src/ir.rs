@@ -271,6 +271,8 @@ pub struct RunInfo {
     pub list_marker: Option<String>,
     /// For table cells: (table ordinal, row, column).
     pub cell: Option<(u32, u32, u32)>,
+    /// 1-based source line of the block that holds this run.
+    pub line: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

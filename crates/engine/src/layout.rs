@@ -91,6 +91,9 @@ pub struct TextItem {
     pub asc: f32,
     pub line_h: f32,
     pub run: RunId,
+    /// Char index of the galley's first char within the run (code split per line when
+    /// wrapping); 0 otherwise.
+    pub char_base: usize,
     /// Decorations, galley-relative.
     pub decos: Vec<Deco>,
     pub links: Vec<LinkRange>,
@@ -140,6 +143,8 @@ pub struct ScrollItem {
     pub items: Vec<Item>,
     /// Background used for the edge fades.
     pub fade: Color32,
+    /// Per-band fade colors (y0, y1, color), e.g. table rows; empty = `fade` everywhere.
+    pub fade_bands: Vec<(f32, f32, Color32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -837,6 +842,7 @@ impl Env<'_> {
             asc: asc_b,
             line_h: base.line_h,
             run,
+            char_base: 0,
             decos: Vec::new(),
             links: Vec::new(),
             objects: Vec::new(),
@@ -1094,6 +1100,24 @@ pub fn layout_top(env: &Env, block: &Block, w: f32) -> LBlock {
         anchors: out.anchors,
         uris: out.uris,
         needs_highlight: env.needs_highlight.get(),
+    }
+}
+
+/// Lay out a footnote's blocks for the hover card (14 px, `text-2`).
+pub fn layout_note(env: &Env, blocks: &[Block], w: f32) -> LBlock {
+    let mut out = Out::default();
+    let mut y = 0.0;
+    let mut ctx = Ctx::root(env.pal);
+    ctx.small = true;
+    ctx.in_item = true;
+    ctx.tight = true;
+    env.children(blocks, 0.0, w, &ctx, &mut out, &mut y);
+    LBlock {
+        height: y.max(0.0),
+        items: out.items,
+        anchors: out.anchors,
+        uris: out.uris,
+        needs_highlight: false,
     }
 }
 
@@ -1357,38 +1381,86 @@ impl Env<'_> {
             Role::DelSign => pal.alert.caution.fg,
         };
         let text = &code.text;
-        let mut job = LayoutJob {
-            break_on_newline: true,
-            ..Default::default()
-        };
-        let mut pos = 0;
-        if let Some(h) = &hl {
-            for (r, role) in &h.spans {
-                if r.start > pos {
-                    job.append(&text[pos..r.start], 0.0, fmt(pal.text));
+        let no_spans = Vec::new();
+        let spans = hl.as_ref().map_or(&no_spans, |h| &h.spans);
+        // Galley for a byte range of the code, highlight spans clipped to it. `lead` is the
+        // first section's leading space (negative for hanging indents).
+        let build = |range: Range<usize>, lead: f32, wrap: f32| -> Arc<Galley> {
+            let mut job = LayoutJob {
+                break_on_newline: true,
+                ..Default::default()
+            };
+            job.wrap.max_width = wrap;
+            let mut pos = range.start;
+            let push = |job: &mut LayoutJob, s: usize, e: usize, color: Color32| {
+                let first = job.sections.is_empty();
+                job.append(&text[s..e], if first { lead } else { 0.0 }, fmt(color));
+            };
+            let from = spans.partition_point(|(r, _)| r.end <= range.start);
+            for (r, role) in &spans[from..] {
+                if r.start >= range.end {
+                    break;
                 }
-                job.append(&text[r.clone()], 0.0, fmt(role_color(*role)));
-                pos = r.end;
+                let (s, e) = (r.start.max(range.start), r.end.min(range.end));
+                if s > pos {
+                    push(&mut job, pos, s, pal.text);
+                }
+                push(&mut job, s, e, role_color(*role));
+                pos = e;
             }
-        }
-        if pos < text.len() {
-            job.append(&text[pos..], 0.0, fmt(pal.text));
-        }
-        if job.text.is_empty() {
-            job.sections.push(LayoutSection {
-                leading_space: 0.0,
-                byte_range: ByteIndex(0)..ByteIndex(0),
-                format: fmt(pal.text),
-            });
-        }
-        let inner_w = (w - 2.0 * pad_x).max(10.0);
-        job.wrap.max_width = if self.wrap_code {
-            inner_w
-        } else {
-            f32::INFINITY
+            if pos < range.end {
+                push(&mut job, pos, range.end, pal.text);
+            }
+            if job.sections.is_empty() {
+                job.sections.push(LayoutSection {
+                    leading_space: lead,
+                    byte_range: ByteIndex(0)..ByteIndex(0),
+                    format: fmt(pal.text),
+                });
+            }
+            self.galley(job)
         };
-        let galley = self.galley(job);
-        let code_h = galley.rect.height().max(line_h);
+        let inner_w = (w - 2.0 * pad_x).max(10.0);
+        let code_top = top + header_h + pad_t;
+        // (galley, x offset, y, char base, source line index)
+        let mut pieces: Vec<(Arc<Galley>, f32, f32, usize, usize)> = Vec::new();
+        if self.wrap_code {
+            // One galley per source line; continuation rows are indented to the line's
+            // leading whitespace + 2ch (the first row starts that far to the left).
+            let char_w = self
+                .ctx
+                .fonts_mut(|f| f.glyph_width(&FontId::new(size, family.clone()), ' '));
+            let (mut yy, mut base, mut byte) = (code_top, 0usize, 0usize);
+            for (li, line) in text.split('\n').enumerate() {
+                let cols: usize = line
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .map(|c| if c == '\t' { 4 } else { 1 })
+                    .sum();
+                let indent = ((cols + 2) as f32 * char_w).min(inner_w * 0.5);
+                let g = build(
+                    byte..byte + line.len(),
+                    -indent,
+                    (inner_w - indent).max(40.0),
+                );
+                let h = g.rect.height().max(line_h);
+                pieces.push((g, indent, yy, base, li));
+                yy += h;
+                base += line.chars().count() + 1;
+                byte += line.len() + 1;
+            }
+        } else {
+            pieces.push((
+                build(0..text.len(), 0.0, f32::INFINITY),
+                0.0,
+                code_top,
+                0,
+                0,
+            ));
+        }
+        let code_h = pieces.last().map_or(line_h, |(g, _, yy, _, _)| {
+            yy + g.rect.height().max(line_h) - code_top
+        });
         let total_h = header_h + pad_t + code_h + pad_b;
         let frame = Rect::from_min_size(pos2(x, top), vec2(w, total_h));
         out.items.push(Item::Fill {
@@ -1418,54 +1490,69 @@ impl Env<'_> {
             pos2(x + 1.0, top + header_h),
             pos2(x + w - 1.0, top + total_h - 1.0),
         );
-        let content_w = (galley.rect.width() + 2.0 * pad_x).max(area.width());
+        let widest = pieces
+            .iter()
+            .map(|(g, ..)| g.rect.width())
+            .fold(0.0, f32::max);
+        let content_w = if self.wrap_code {
+            area.width()
+        } else {
+            (widest + 2.0 * pad_x).max(area.width())
+        };
         let mut items = Vec::new();
         if let Some(h) = &hl {
-            let starts = row_starts(&galley);
-            let line_starts: Vec<usize> = std::iter::once(0)
-                .chain(
-                    text.char_indices()
-                        .filter(|(_, c)| *c == '\n')
-                        .map(|(i, _)| i + 1),
-                )
-                .collect();
             for (line, kind) in &h.line_bg {
-                let Some(&byte) = line_starts.get(*line as usize) else {
-                    continue;
+                let line = *line as usize;
+                // (y top, y bottom) of the source line.
+                let span = if self.wrap_code {
+                    pieces
+                        .get(line)
+                        .map(|(g, _, yy, _, _)| (*yy, yy + g.rect.height().max(line_h)))
+                } else {
+                    let (g, _, yy, _, _) = &pieces[0];
+                    let starts = row_starts(g);
+                    let byte = text
+                        .split('\n')
+                        .take(line)
+                        .map(|l| l.len() + 1)
+                        .sum::<usize>();
+                    let ch = text[..byte.min(text.len())].chars().count();
+                    let r = char_rect(g, &starts, ch);
+                    Some((yy + r.top(), yy + r.bottom()))
                 };
-                let ch = text[..byte].chars().count();
-                let rect = char_rect(&galley, &starts, ch);
+                let Some((y0, y1)) = span else { continue };
                 let color = match kind {
                     LineBg::Add => pal.syntax.diff_add_bg,
                     LineBg::Del => pal.syntax.diff_del_bg,
                 };
                 items.push(Item::Fill {
-                    rect: Rect::from_min_max(
-                        pos2(-1.0, top + header_h + pad_t + rect.top()),
-                        pos2(content_w + 1.0, top + header_h + pad_t + rect.bottom()),
-                    ),
+                    rect: Rect::from_min_max(pos2(-1.0, y0), pos2(content_w + 1.0, y1)),
                     color,
                     radius: CornerRadius::ZERO,
                 });
             }
         }
-        items.push(Item::Text(TextItem {
-            pos: pos2(pad_x - 1.0, top + header_h + pad_t),
-            galley,
-            shift,
-            asc,
-            line_h,
-            run: c.run,
-            decos: Vec::new(),
-            links: Vec::new(),
-            objects: Vec::new(),
-        }));
+        for (galley, indent, yy, base, _) in pieces {
+            items.push(Item::Text(TextItem {
+                pos: pos2(pad_x - 1.0 + indent, yy),
+                galley,
+                shift,
+                asc,
+                line_h,
+                run: c.run,
+                char_base: base,
+                decos: Vec::new(),
+                links: Vec::new(),
+                objects: Vec::new(),
+            }));
+        }
         out.items.push(Item::Scroll(ScrollItem {
             id,
             frame: area,
             content_w,
             items,
             fade: pal.code_bg,
+            fade_bands: Vec::new(),
         }));
         out.items.push(Item::Frame {
             rect: frame,
@@ -1813,6 +1900,7 @@ impl Env<'_> {
         let total_h = row_y + 1.0 - top;
         let content_w = table_w.max(w - 2.0);
         let r8 = 7u8;
+        let mut fade_bands = Vec::new();
         for (rect, header, ri) in &row_rects {
             let is_last = *ri + 1 == nrows;
             let fill = if *header {
@@ -1822,6 +1910,7 @@ impl Env<'_> {
             } else {
                 None
             };
+            fade_bands.push((rect.top(), rect.bottom() - 1.0, fill.unwrap_or(pal.bg)));
             let rect =
                 Rect::from_min_max(rect.min, pos2(content_w.max(rect.right()), rect.bottom()));
             if let Some(color) = fill {
@@ -1867,6 +1956,7 @@ impl Env<'_> {
             content_w: table_w,
             items,
             fade: pal.bg,
+            fade_bands,
         }));
         out.items.push(Item::Frame {
             rect: frame,

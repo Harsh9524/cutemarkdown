@@ -35,6 +35,8 @@ pub struct Parsed {
 
 #[derive(Clone, Debug, Default)]
 pub struct HeadingMeta {
+    /// The heading text run.
+    pub run: RunId,
     pub top: u32,
     /// 1-based source lines: the heading line and the last line of its section.
     pub line: u32,
@@ -82,6 +84,7 @@ pub fn parse(source: &str, base_dir: Option<&Path>) -> Parsed {
         list_depth: 0,
         table_ord: 0,
         cell: None,
+        cur_line: 1,
         id_counts: HashMap::new(),
     };
 
@@ -526,6 +529,8 @@ struct P<'s> {
     list_depth: u8,
     table_ord: u32,
     cell: Option<(u32, u32, u32)>,
+    /// Source line of the block being converted (for RunInfo::line).
+    cur_line: u32,
     id_counts: HashMap<u64, u32>,
 }
 
@@ -767,6 +772,7 @@ impl P<'_> {
                 None
             },
             cell: self.cell,
+            line: self.cur_line,
         });
         id
     }
@@ -1107,6 +1113,7 @@ impl P<'_> {
             (d.value.clone(), d.sourcepos)
         };
         let line = self.line(sp.start.line);
+        self.cur_line = line;
         let end_line = self.line(sp.end.line).max(line);
         let kind = match value {
             NodeValue::Paragraph => {
@@ -1321,8 +1328,9 @@ impl P<'_> {
             text: plain,
             anchor,
         });
-        let _ = run;
+
         self.heading_meta.push(HeadingMeta {
+            run,
             top: 0,
             line,
             section_end: line,
@@ -1420,6 +1428,7 @@ impl P<'_> {
     // ---- HTML blocks ---------------------------------------------------------------------
 
     fn html_block(&mut self, raw: &str, line: u32, end_line: u32, sink: &mut Sink) {
+        self.cur_line = line;
         let toks = tokenize_with_raw(raw);
         let mut inl: Option<(Inl, Option<u8>)> = None; // (builder, heading level)
         let mut summary: Option<Inl> = None;

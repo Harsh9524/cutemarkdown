@@ -12,7 +12,8 @@
 //! `--anchor ID`, `--find QUERY`, `--screenshot OUT.png`, `--frames N` (frames before capture),
 //! `--wrap` (wrap long code lines), `--top-inset 44` (space for an app bar), `--select-all` (select everything, print the copy text),
 //! `--reload FILE` (after the first frames, swap in FILE with `keep_position`, like live reload),
-//! `--hover X,Y` (move the pointer there before capturing), `--click X,Y` (click there once),
+//! `--hover X,Y` (move the pointer there before capturing), `--click X,Y` / `--rclick X,Y`
+//! (left/right click there once),
 //! `--drag X,Y,X2,Y2` (drag-select), `--key NAME` (press a key once: PageDown, End, …),
 //! `--bench` (scroll through the whole document and print layout and frame times; use a
 //! release build: `cargo run --release -p cutemarkdown-engine --example preview -- FILE --bench`).
@@ -38,6 +39,7 @@ struct Args {
     reload: Option<std::path::PathBuf>,
     hover: Option<egui::Pos2>,
     click: Option<egui::Pos2>,
+    rclick: Option<egui::Pos2>,
     drag: Option<(egui::Pos2, egui::Pos2)>,
     key: Option<egui::Key>,
     wheel: Option<(egui::Pos2, egui::Vec2)>,
@@ -69,6 +71,7 @@ fn parse_args() -> Args {
         reload: None,
         hover: None,
         click: None,
+        rclick: None,
         drag: None,
         key: None,
         wheel: None,
@@ -114,6 +117,7 @@ fn parse_args() -> Args {
             "--reload" => a.reload = Some(val().into()),
             "--hover" => a.hover = Some(pos(&val())),
             "--click" => a.click = Some(pos(&val())),
+            "--rclick" => a.rclick = Some(pos(&val())),
             "--drag" => {
                 let v = val();
                 let p: Vec<f32> = v.split(',').map(|s| s.trim().parse().unwrap()).collect();
@@ -148,10 +152,18 @@ impl eframe::App for Preview {
         {
             raw.events.push(egui::Event::PointerMoved(p));
         }
-        if let Some(p) = self.args.click {
+        if let Some((p, button)) = self
+            .args
+            .click
+            .map(|p| (p, egui::PointerButton::Primary))
+            .or(self
+                .args
+                .rclick
+                .map(|p| (p, egui::PointerButton::Secondary)))
+        {
             let ev = |pressed| egui::Event::PointerButton {
                 pos: p,
-                button: egui::PointerButton::Primary,
+                button,
                 pressed,
                 modifiers: Default::default(),
             };
@@ -333,7 +345,9 @@ fn bench(args: &Args, doc: Document, parse_secs: f64) {
                 });
         });
         let t1 = std::time::Instant::now();
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let mut out = out;
+        out.textures_delta.clear(); // no GPU here
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         let t2 = std::time::Instant::now();
         if frame == 200 {
             let verts: usize = prims
