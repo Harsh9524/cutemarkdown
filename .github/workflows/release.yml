@@ -1,0 +1,72 @@
+name: Release
+
+# Push a tag like v1.0.0 (it must match the version in Cargo.toml) to publish a GitHub Release
+# with the installer and the portable zip attached.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: Build and publish (Windows x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag must match the Cargo version
+        run: |
+          version=$(bash scripts/version.sh)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Build release
+        run: cargo build --release --locked --bin cutemarkdown
+
+      - name: Check imports (Windows system DLLs only)
+        run: python scripts/check-imports.py target/release/cutemarkdown.exe
+
+      - name: Ensure NSIS
+        run: |
+          if ! command -v makensis >/dev/null 2>&1 \
+             && [ ! -x "/c/Program Files (x86)/NSIS/makensis.exe" ] \
+             && [ ! -x "/c/Program Files/NSIS/makensis.exe" ]; then
+            choco install nsis -y --no-progress
+          fi
+
+      - name: Package (installer and portable zip)
+        run: bash scripts/package.sh --exe target/release/cutemarkdown.exe --out dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*-setup-x64.exe ./*-portable-x64.zip | sed 's# \./# #' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*-setup-x64.exe
+            dist/*-portable-x64.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          # v1.2.3-rc.1 and friends are marked as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

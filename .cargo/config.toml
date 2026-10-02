@@ -1,0 +1,15 @@
+# Packaging-related build configuration. See docs/INSTALL.md ("Build from source").
+#
+# Goal: cutemarkdown.exe is a single standalone file. It must only import Windows system DLLs
+# (no VC++ Redistributable, no MinGW runtime DLLs). `scripts/check-imports.py` verifies this and
+# is run by scripts/build-windows.sh and by CI.
+
+# MSVC (Windows CI / local Windows builds): link the C runtime statically, so the .exe does not
+# need vcruntime140.dll / the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# GNU (cross-compiling from Linux with mingw-w64): link libgcc and winpthreads statically, so the
+# .exe does not need libgcc_s_seh-1.dll / libwinpthread-1.dll next to it.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
