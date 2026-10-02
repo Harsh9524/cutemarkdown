@@ -13,11 +13,28 @@ for _c in python3 python; do
 done
 unset _c
 
-# Absolute path in the form native tools expect: C:/x/y under Git Bash on Windows, plain POSIX elsewhere.
+# Windows programs (python.exe, makensis.exe, ...) end their lines with "\r\n". Git Bash's $(...)
+# only strips the "\n", so a captured value keeps a trailing "\r". Never use such a value as is.
+strip_cr() { printf '%s' "${1//$'\r'/}"; }
+
+# A release version: 1.2.3, optionally with a pre-release suffix (1.2.3-rc.1). The installer script
+# derives its numeric version resource from it, so anything else (including a stray "\r") must stop
+# the build here, with a readable message, instead of failing inside makensis.
+check_version() {
+  if [[ ! $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    printf 'error: not a valid version: [%s]\n' "$(printf '%s' "$1" | cat -v)" >&2
+    return 1
+  fi
+}
+
+# Absolute path in the form native tools expect: C:\x\y (backslashes) under Git Bash on Windows,
+# plain POSIX elsewhere. Backslashes, not C:/x/y: makensis.exe splits the File command's path on
+# "\" only, so 'File "C:/x/y.exe"' reports "no files found" even though the file exists.
 native() {
   local p
   p=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$p"; else printf '%s' "$p"; fi
+  if command -v cygpath >/dev/null 2>&1; then p=$(cygpath -w "$p"); fi
+  strip_cr "$p"
 }
 
 # Print "<size> bytes  <path>" for each file.

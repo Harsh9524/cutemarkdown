@@ -1,0 +1,3 @@
+# portable-README.txt is converted to CRLF by scripts/package.sh; keep the source LF.
+portable-README.txt text eol=lf
+*.bmp binary

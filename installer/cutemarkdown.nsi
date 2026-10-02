@@ -4,7 +4,9 @@
 ; HKCU and %LOCALAPPDATA%. Pages: Welcome -> Install -> Finish.
 ;
 ; Build it with scripts/package.sh (the single place that calls makensis; used by
-; scripts/build-windows.sh and by the GitHub workflows). Equivalent manual command:
+; scripts/build-windows.sh and by the GitHub workflows). package.sh writes the build parameters
+; (VERSION, EXE_PATH, OUTFILE) to installer/build-defs.nsh, which this script includes. They can
+; also be given by hand instead:
 ;   makensis -DVERSION=1.0.0 -DEXE_PATH=<abs path>/cutemarkdown.exe -DOUTFILE=<abs path>/setup.exe installer/cutemarkdown.nsi
 ; Relative paths inside this script are relative to its own directory (makensis changes into it),
 ; so EXE_PATH and OUTFILE must be ABSOLUTE.
@@ -22,6 +24,10 @@ ManifestLongPathAware true
 ;--------------------------------------------------------------------------------------------
 ; Build-time parameters
 ;--------------------------------------------------------------------------------------------
+; Written by scripts/package.sh (absent when the parameters are given with -D instead). Passing them
+; through a file keeps paths and the version out of makensis' command line, where Git Bash/MSYS
+; argument rewriting and stray "\r" characters from Windows tools can corrupt them.
+!include /NONFATAL "build-defs.nsh"
 !ifndef VERSION
   !error "Pass the version: makensis /DVERSION=1.2.3 ..."
 !endif
@@ -31,6 +37,13 @@ ManifestLongPathAware true
 !ifndef OUTFILE
   !define OUTFILE "../dist/cutemarkdown-${VERSION}-setup-x64.exe"
 !endif
+
+; makensis on Windows only treats "\" as a path separator in the File command (NSIS util.cpp,
+; get_dir_name: "BUGBUG: Windows should support \ and /"). Given C:/a/b/app.exe it looks for a file
+; with that whole name in the current directory and fails with 'File: "C:/a/b/app.exe" -> no files
+; found.' even though the file exists. So always hand File a backslash path. (makensis on Linux
+; converts "\" back to "/".)
+!searchreplace EXE_PATH_NSIS "${EXE_PATH}" "/" "\"
 
 ; "1.2.3-rc.1" -> numeric quad "1.2.3.0" for the version resource.
 !searchparse "${VERSION}-" "" VER_CORE "-"
@@ -175,22 +188,20 @@ Function OpenDefaultApps
   ${EndIf}
 FunctionEnd
 
-; Delete HKCU\<key> if it has no values and no subkeys. (DeleteRegKey /ifempty only looks at subkeys.)
+; Delete HKCU\<key> if it has no values (the default value included) and no subkeys.
+; (DeleteRegKey /ifempty only looks at subkeys.)
 Function un.PruneEmptyKey
   Exch $0                              ; key
   Push $1
   Push $2
-  Push $3
-  ReadRegStr $1 HKCU "$0" ""           ; default value
   ClearErrors
-  EnumRegValue $2 HKCU "$0" 0          ; first named value
-  EnumRegKey $3 HKCU "$0" 0            ; first subkey
-  ${If} $1 == ""
-  ${AndIf} $2 == ""
-  ${AndIf} $3 == ""
-    DeleteRegKey HKCU "$0"
+  EnumRegValue $1 HKCU "$0" 0          ; error flag set = no values at all. A present default value enumerates with an EMPTY name, so the returned name cannot be used for this test
+  ${If} ${Errors}
+    EnumRegKey $2 HKCU "$0" 0          ; "" = no subkeys. (EnumRegKey does NOT set the error flag at the end of the list, so test the name here, not ${Errors}.)
+    ${If} $2 == ""
+      DeleteRegKey HKCU "$0"
+    ${EndIf}
   ${EndIf}
-  Pop $3
   Pop $2
   Pop $1
   Pop $0
@@ -200,9 +211,21 @@ FunctionEnd
 ; Install
 ;--------------------------------------------------------------------------------------------
 Function .onInit
-  ${IfNot} ${RunningX64}
-  ${OrIfNot} ${AtLeastWin10}
-    MessageBox MB_ICONSTOP|MB_OK "cutemarkdown requires 64-bit Windows 10 or later." /SD IDOK
+  ; The stub is 32-bit x86, so ${RunningX64} (IsWow64) is also true on ARM64, including
+  ; Windows 10 on ARM, which cannot run x64 code. Allow native x64, or ARM64 with Windows 11
+  ; (build 22000+), the first ARM release that emulates x64.
+  StrCpy $0 0
+  ${If} ${AtLeastWin10}
+    ${If} ${IsNativeAMD64}
+      StrCpy $0 1
+    ${ElseIf} ${IsNativeARM64}
+    ${AndIf} ${AtLeastBuild} 22000
+      StrCpy $0 1
+    ${EndIf}
+  ${EndIf}
+  ${If} $0 = 0
+    MessageBox MB_ICONSTOP|MB_OK "cutemarkdown requires 64-bit (x64) Windows 10 or later, or Windows 11 on ARM." /SD IDOK
+    SetErrorLevel 2
     Abort
   ${EndIf}
 FunctionEnd
@@ -212,15 +235,45 @@ Section "cutemarkdown" SecMain
   SetShellVarContext current
   SetOutPath "$INSTDIR"
 
-  ; In-place upgrade without closing anything: Windows lets us rename a running .exe even
-  ; though it cannot be overwritten, so move it aside and write the new one next to it.
-  Delete "$INSTDIR\${EXE}.old"
+  ; In-place upgrade without closing anything: Windows allows renaming a running .exe but not
+  ; overwriting or deleting it. Move it aside under a free name (.old, .old1, ...), because an
+  ; earlier .old may still be running too.
+  Delete "$INSTDIR\${EXE}.old*"                 ; best effort: earlier copies that have exited
+  StrCpy $R0 ""                                 ; suffix actually used ("" = nothing moved)
   ${If} ${FileExists} "$INSTDIR\${EXE}"
-    ClearErrors
-    Rename "$INSTDIR\${EXE}" "$INSTDIR\${EXE}.old"
+    StrCpy $R1 0
+    ${Do}
+      ${If} $R1 == 0
+        StrCpy $R2 ""
+      ${Else}
+        StrCpy $R2 $R1
+      ${EndIf}
+      ClearErrors
+      Rename "$INSTDIR\${EXE}" "$INSTDIR\${EXE}.old$R2"
+      ${IfNot} ${Errors}
+        StrCpy $R0 ".old$R2"
+        ${Break}
+      ${EndIf}
+      IntOp $R1 $R1 + 1
+    ${LoopUntil} $R1 >= 100
   ${EndIf}
-  File "/oname=${EXE}" "${EXE_PATH}"
-  Delete "$INSTDIR\${EXE}.old"          ; best effort; stays until the old copy exits if it is running
+  ClearErrors
+  ${If} ${FileExists} "$INSTDIR\${EXE}"
+    SetErrors                                   ; could not be moved aside: do not try to overwrite it
+  ${Else}
+    File "/oname=${EXE}" "${EXE_PATH_NSIS}"
+  ${EndIf}
+  ${If} ${Errors}
+    ${If} $R0 != ""
+      Rename "$INSTDIR\${EXE}$R0" "$INSTDIR\${EXE}"   ; put the previous version back
+    ${EndIf}
+    ; Nothing else has been changed yet (no uninstaller, shortcut or registry writes), so the
+    ; registry still matches the binary on disk.
+    MessageBox MB_ICONSTOP|MB_OK "Could not replace $INSTDIR\${EXE}.$\r$\nClose cutemarkdown and run setup again." /SD IDOK
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
+  Delete "$INSTDIR\${EXE}.old*"                 ; best effort; a copy that is still running stays until the next install or uninstall
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   ; Start Menu shortcut
@@ -272,6 +325,7 @@ SectionEnd
 ; Uninstall
 ;--------------------------------------------------------------------------------------------
 ; $9 = 1 if PATH exists but cannot be opened for writing (a running .exe is locked by Windows).
+; Uses $0.
 !macro CheckLocked PATH
   ${If} ${FileExists} "${PATH}"
     ClearErrors
@@ -285,27 +339,40 @@ SectionEnd
 !macroend
 
 Function un.onInit
-  ; Never kill the app: if it is running, ask the user to close it. (Silent uninstalls skip
-  ; the question and remove what they can.) ".old" is the previous copy left by an upgrade
-  ; that happened while the app was open; it is the locked one until the app is restarted.
-  ${Unless} ${Silent}
-    retry:
-    StrCpy $9 0
-    !insertmacro CheckLocked "$INSTDIR\${EXE}"
-    !insertmacro CheckLocked "$INSTDIR\${EXE}.old"
-    ${If} $9 == 1
-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "cutemarkdown is running.$\r$\nClose it, then click Retry to continue uninstalling." IDRETRY retry
-      Abort
-    ${EndIf}
-  ${EndUnless}
+  ; Never kill the app. If it (or a ".old*" copy left by an upgrade done while it was open) is
+  ; running, ask the user to close it. A silent uninstall cannot ask, so it changes nothing and
+  ; exits with code 2; run it again once the app is closed.
+  retry:
+  StrCpy $9 0
+  !insertmacro CheckLocked "$INSTDIR\${EXE}"
+  FindFirst $R3 $R4 "$INSTDIR\${EXE}.old*"
+  ${DoWhile} $R4 != ""
+    !insertmacro CheckLocked "$INSTDIR\$R4"
+    FindNext $R3 $R4
+  ${Loop}
+  FindClose $R3
+  ${If} $9 == 1
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "cutemarkdown is running.$\r$\nClose it, then click Retry to continue uninstalling." /SD IDCANCEL IDRETRY retry
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
 FunctionEnd
 
 Section "Uninstall"
   SetShellVarContext current
 
   ; Files (never RMDir /r: only our own files, and the folder only if it is then empty)
+  ; The program goes first. If it cannot be deleted (it was started after the check in
+  ; un.onInit), stop before removing uninstall.exe or any registry entry, so the uninstall can be
+  ; run again.
+  ClearErrors
   Delete "$INSTDIR\${EXE}"
-  Delete "$INSTDIR\${EXE}.old"
+  Delete "$INSTDIR\${EXE}.old*"
+  ${If} ${Errors}
+    MessageBox MB_ICONSTOP|MB_OK "cutemarkdown is running. Close it, then run the uninstaller again." /SD IDOK
+    SetErrorLevel 2
+    Abort
+  ${EndIf}
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

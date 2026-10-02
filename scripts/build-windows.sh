@@ -32,7 +32,7 @@ if command -v rustup >/dev/null 2>&1 && ! rustup target list --installed | grep 
 fi
 [ "$missing" = 0 ] || exit 1
 
-VERSION=$(scripts/version.sh)
+VERSION=$(strip_cr "$(scripts/version.sh)")
 echo "==> cutemarkdown $VERSION: cargo build --release --target $TARGET"
 cargo build --release --locked --target "$TARGET" --bin cutemarkdown
 

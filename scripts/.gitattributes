@@ -1,0 +1,3 @@
+# The scripts must keep LF endings (a CRLF checkout breaks them outside Git Bash).
+*.sh text eol=lf
+*.py text eol=lf

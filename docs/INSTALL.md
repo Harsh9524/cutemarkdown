@@ -20,15 +20,22 @@ shortcut, and lists cutemarkdown under *Settings > Apps* and *Default apps*.
 > The installer is not code-signed yet, so Windows SmartScreen may say *"Windows protected your PC"*.
 > Click **More info > Run anyway**.
 
-**Silent install** (scripts, deployment tools):
+**Silent install** (scripts, deployment tools). To choose the folder, add `/D=<path>` as the last
+argument, without quotes, even if the path contains spaces. Do not put a comment after it on the
+same line: everything after `/D=` becomes part of the path.
 
 ```bat
 cutemarkdown-1.0.0-setup-x64.exe /S
-cutemarkdown-1.0.0-setup-x64.exe /S /D=C:\Tools\cutemarkdown   :: custom folder; /D must be last
+cutemarkdown-1.0.0-setup-x64.exe /S /D=C:\Tools\cutemarkdown
 ```
 
+On a PC that is not x64 Windows 10 or later (or Windows 11 on ARM), setup stops and, when silent,
+exits with code 2.
+
 **Update:** run the newer installer over the old one. It upgrades in place and does not close anything:
-if cutemarkdown is open, the new version starts the next time you launch it.
+if cutemarkdown is open, the new version starts the next time you launch it. If the running copy
+cannot be moved aside, setup changes nothing and (silent) exits with code 2; close cutemarkdown and
+run it again.
 
 ## Make it your default Markdown app
 
@@ -53,12 +60,19 @@ It removes the files, the Start Menu shortcut and everything it registered. If c
 running it asks you to close it first. It also offers to delete the settings the app itself keeps in
 `%APPDATA%\cutemarkdown` (kept by default, and always kept on a silent uninstall).
 
+A silent uninstall (`/S`, what `winget uninstall` and deployment tools run) cannot ask. While
+cutemarkdown is running it removes nothing, so the app stays listed under *Installed apps*, and the
+uninstaller exits with code 2 (when it is started with `_?=<install folder>`; without it, NSIS hands
+over to a temporary copy and the command returns at once). Close cutemarkdown and run it again.
+
 ## Portable
 
 1. Unzip `cutemarkdown-<version>-portable-x64.zip` anywhere (a USB stick is fine).
 2. Double-click `cutemarkdown.exe`, or drag a `.md` file onto it.
 
-It does not write to the registry and needs no installation. Delete the folder to remove it.
+It does not write to the registry and needs no installation. It remembers its window size and
+position in `%APPDATA%\cutemarkdown`. To remove every trace, delete the unzipped folder and
+`%APPDATA%\cutemarkdown`.
 To open `.md` files with it by double-click, use *Open with > Choose another app > Always* once.
 
 ## Build from source

@@ -9,7 +9,9 @@ Run it
       cutemarkdown.exe notes.md
 
 Nothing to install. It is a single file with no extra runtimes needed, and it does not
-touch the registry. Put it anywhere (a USB stick works fine). Delete the file to remove it.
+touch the registry. Put it anywhere (a USB stick works fine). It remembers its window
+size and position in %APPDATA%\cutemarkdown. To remove it completely, delete the file
+and that folder.
 
 Make it your default Markdown app (optional)
   Right-click any .md file -> Open with -> Choose another app -> More apps ->

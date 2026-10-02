@@ -31,6 +31,7 @@ jobs:
       - name: Tag must match the Cargo version
         run: |
           version=$(bash scripts/version.sh)
+          version=${version%$'\r'}   # Windows tools end lines with CRLF and $(...) keeps the CR
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
             exit 1
