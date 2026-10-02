@@ -10,8 +10,16 @@ name = "engine"
 
 [dependencies]
 egui.workspace = true
+# Markdown parser (GFM). No CLI, no onig, no syntect integration: we walk the AST ourselves.
+comrak = { version = "0.55", default-features = false }
+# Syntax highlighting with the pure-Rust regex engine; scopes are mapped to our own palette roles.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy", "dump-load"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+# Same version epaint uses: charmap checks for lazily loaded system fallback fonts.
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 eframe.workspace = true
-egui_extras.workspace = true
+# `svg_text`: text inside SVGs (README badges). The app should enable it too.
+egui_extras = { workspace = true, features = ["svg_text"] }
 image.workspace = true

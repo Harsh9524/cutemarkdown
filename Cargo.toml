@@ -9,8 +9,8 @@ license = "MIT"
 repository = "https://github.com/harsh9524/cutemarkdown"
 
 [workspace.dependencies]
-egui = "0.36"
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "persistence", "x11", "wayland"] }
+egui = { version = "0.36", default-features = false }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit", "persistence", "x11", "wayland"] }
 egui_extras = { version = "0.36", features = ["file", "image", "svg", "http"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 

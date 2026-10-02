@@ -101,7 +101,11 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 const fn alert(fg: u32, tint: u32, border: u32) -> AlertColors {
-    AlertColors { fg: hex(fg), tint: hex(tint), border: hex(border) }
+    AlertColors {
+        fg: hex(fg),
+        tint: hex(tint),
+        border: hex(border),
+    }
 }
 
 impl Palette {
@@ -285,11 +289,23 @@ pub struct Style {
     pub measure: f32,
     /// Soft-wrap long code lines instead of horizontal scrolling.
     pub wrap_code: bool,
+    /// Height of chrome overlaying the top of the view (the 44 pt app bar; 0 in Zen). The
+    /// engine adds this plus its own 40 pt margin above the first block; content still scrolls
+    /// underneath it. Anchor jumps land 24 pt below it.
+    pub top_inset: f32,
 }
 
 impl Style {
     pub fn new(theme: ThemeKind, font: FontChoice, text_size: f32, measure: f32) -> Self {
-        Self { theme, palette: Palette::for_theme(theme), font, text_size, measure, wrap_code: false }
+        Self {
+            theme,
+            palette: Palette::for_theme(theme),
+            font,
+            text_size,
+            measure,
+            wrap_code: false,
+            top_inset: 0.0,
+        }
     }
 }
 

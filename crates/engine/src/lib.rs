@@ -16,7 +16,18 @@
 pub mod fonts;
 pub mod style;
 
+mod find;
+mod highlight;
+mod html;
+mod icons;
+mod ir;
+mod layout;
+mod parse;
+mod slug;
+mod view;
+
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub use style::{FontChoice, Palette, Style, SyntaxPalette, ThemeKind};
 
@@ -37,7 +48,10 @@ pub enum LinkTarget {
     /// `http(s)://`, `mailto:` and other external URLs: open in the system browser.
     External(String),
     /// A local file (resolved against the document's directory), e.g. `./architecture.md#data-model`.
-    File { path: PathBuf, anchor: Option<String> },
+    File {
+        path: PathBuf,
+        anchor: Option<String>,
+    },
     /// An in-document anchor (`#rollback-plan`), without the leading `#`.
     Anchor(String),
 }
@@ -46,58 +60,38 @@ pub enum LinkTarget {
 pub struct Document {
     source: String,
     base_dir: Option<PathBuf>,
-    title: Option<String>,
-    headings: Vec<Heading>,
-    word_count: usize,
+    p: parse::Parsed,
+    /// Characters no bundled font covers (system fallbacks are loaded for them).
+    missing: Vec<char>,
+    search: OnceLock<Vec<find::SearchText>>,
 }
 
 impl Document {
     /// Parse Markdown. `base_dir` is used to resolve relative links and images.
     pub fn parse(source: &str, base_dir: Option<&Path>) -> Self {
-        // STUB: minimal ATX-heading scan so the shell has something to work with.
-        let mut headings = Vec::new();
-        let mut in_fence = false;
-        for line in source.lines() {
-            let t = line.trim_start();
-            if t.starts_with("```") || t.starts_with("~~~") {
-                in_fence = !in_fence;
-            }
-            if in_fence {
-                continue;
-            }
-            let hashes = t.chars().take_while(|&c| c == '#').count();
-            if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
-                let text = t[hashes..].trim().trim_end_matches('#').trim().to_owned();
-                let anchor = text
-                    .to_lowercase()
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
-                    .collect::<String>()
-                    .replace(' ', "-");
-                headings.push(Heading { level: hashes as u8, text, anchor });
-            }
-        }
+        let p = parse::parse(source, base_dir);
+        let missing = fonts::missing_chars(p.non_ascii.iter().copied());
         Self {
-            title: headings.iter().find(|h| h.level == 1).map(|h| h.text.clone()),
-            word_count: source.split_whitespace().count(),
             source: source.to_owned(),
             base_dir: base_dir.map(Path::to_path_buf),
-            headings,
+            p,
+            missing,
+            search: OnceLock::new(),
         }
     }
 
     /// Front-matter `title`, else the first H1.
     pub fn title(&self) -> Option<&str> {
-        self.title.as_deref()
+        self.p.title.as_deref()
     }
 
     pub fn headings(&self) -> &[Heading] {
-        &self.headings
+        &self.p.headings
     }
 
     /// Words of readable text (excluding front matter); used for read-time.
     pub fn word_count(&self) -> usize {
-        self.word_count
+        self.p.word_count
     }
 
     pub fn base_dir(&self) -> Option<&Path> {
@@ -106,6 +100,32 @@ impl Document {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// 1-based source line of a heading (for "Open in editor here").
+    pub fn heading_line(&self, index: usize) -> Option<usize> {
+        self.p.heading_meta.get(index).map(|m| m.line as usize)
+    }
+
+    /// Markdown source of a heading's section: from the heading to the line before the next
+    /// heading of the same or higher level ("Copy section as Markdown").
+    pub fn section_markdown(&self, index: usize) -> Option<String> {
+        let m = self.p.heading_meta.get(index)?;
+        let src = self.source.replace("\r\n", "\n");
+        let lines: Vec<&str> = src.split('\n').collect();
+        let a = (m.line as usize).saturating_sub(1);
+        let b = (m.section_end as usize).min(lines.len());
+        (a < b).then(|| lines[a..b].join("\n").trim_end().to_owned())
+    }
+
+    /// Does this document have a heading, footnote or HTML anchor with this name?
+    pub fn has_anchor(&self, anchor: &str) -> bool {
+        self.p.anchors.contains_key(anchor)
+    }
+
+    fn search_texts(&self) -> &[find::SearchText] {
+        self.search
+            .get_or_init(|| self.p.texts.iter().map(find::SearchText::new).collect())
     }
 }
 
@@ -126,6 +146,12 @@ pub struct DocOutput {
     pub words_remaining: usize,
     /// 1-based source line of the first visible block (for "Open in editor here").
     pub top_source_line: usize,
+    /// The document is taller than the viewport (show the progress line only then).
+    pub scrollable: bool,
+    /// The link in `clicked_link` was Ctrl+clicked or middle-clicked: open it in a new window.
+    pub link_new_window: bool,
+    /// "Open in editor here" was chosen in a heading's context menu: 1-based source line.
+    pub open_in_editor_line: Option<usize>,
 }
 
 /// Result of a find operation.
@@ -139,14 +165,13 @@ pub struct FindStatus {
 /// Stateful document widget.
 pub struct DocView {
     doc: Document,
-    scroll_y: f32,
-    pending_scroll: Option<f32>,
-    find_query: String,
+    v: view::ViewState,
 }
 
 impl DocView {
     pub fn new(doc: Document) -> Self {
-        Self { doc, scroll_y: 0.0, pending_scroll: None, find_query: String::new() }
+        let v = view::ViewState::new(&doc);
+        Self { doc, v }
     }
 
     pub fn document(&self) -> &Document {
@@ -156,89 +181,115 @@ impl DocView {
     /// Replace the document (e.g. live reload). With `keep_position`, the reader stays where
     /// they were (same section / same offset); otherwise the view starts at the top.
     pub fn set_document(&mut self, doc: Document, keep_position: bool) {
+        self.v.set_document(&self.doc, &doc, keep_position);
         self.doc = doc;
-        if !keep_position {
-            self.pending_scroll = Some(0.0);
-        }
     }
 
     /// Paint the document filling the available space (it owns its vertical scroll area).
     pub fn show(&mut self, ui: &mut egui::Ui, style: &Style) -> DocOutput {
-        // STUB: plain-text rendering so the shell can be developed against the real API.
-        let mut out = DocOutput::default();
-        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if let Some(y) = self.pending_scroll.take() {
-            area = area.vertical_scroll_offset(y);
-        }
-        let r = area.show(ui, |ui| {
-            let w = ui.available_width().min(style.measure);
-            ui.vertical_centered(|ui| {
-                ui.set_max_width(w);
-                for block in self.doc.source.split("\n\n") {
-                    let t = block.trim();
-                    if t.is_empty() {
-                        continue;
-                    }
-                    let size = if t.starts_with("# ") { style.text_size * 2.0 } else { style.text_size };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(t).size(size).color(style.palette.text),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(style.text_size * 0.8);
-                }
-            });
-        });
-        self.scroll_y = r.state.offset.y;
-        let max = (r.content_size.y - r.inner_rect.height()).max(1.0);
-        out.progress = (self.scroll_y / max).clamp(0.0, 1.0);
-        let _ = &self.find_query;
-        out
+        self.v.show(&self.doc, ui, style)
     }
 
     pub fn scroll_to_heading(&mut self, index: usize) {
-        let _ = index;
+        if index < self.doc.p.headings.len() {
+            self.v.request(view::ScrollReqPub::Heading(index));
+        }
     }
 
     /// Returns false if no heading/footnote has that anchor.
     pub fn scroll_to_anchor(&mut self, anchor: &str) -> bool {
-        self.doc.headings.iter().position(|h| h.anchor == anchor).map(|i| self.scroll_to_heading(i)).is_some()
+        let anchor = anchor.trim_start_matches('#');
+        let name = if self.doc.p.anchors.contains_key(anchor) {
+            anchor.to_owned()
+        } else {
+            let lower = anchor.to_lowercase();
+            if self.doc.p.anchors.contains_key(&lower) {
+                lower
+            } else {
+                return false;
+            }
+        };
+        self.v.request(view::ScrollReqPub::Anchor(name));
+        true
     }
 
     pub fn scroll_to_top(&mut self) {
-        self.pending_scroll = Some(0.0);
+        self.v.request(view::ScrollReqPub::Y(0.0));
     }
 
     pub fn scroll_to_bottom(&mut self) {
-        self.pending_scroll = Some(f32::MAX);
+        self.v.request(view::ScrollReqPub::Bottom);
     }
 
     /// Current vertical scroll offset in points (for back/forward history).
     pub fn scroll_offset(&self) -> f32 {
-        self.scroll_y
+        self.v.scroll_offset()
     }
 
     pub fn set_scroll_offset(&mut self, y: f32) {
-        self.pending_scroll = Some(y);
+        self.v.request(view::ScrollReqPub::Y(y));
     }
 
     /// Set the find query (case-insensitive); highlights all matches and scrolls to the first one
     /// at or after the current position.
     pub fn set_find_query(&mut self, query: &str) -> FindStatus {
-        self.find_query = query.to_owned();
-        FindStatus::default()
+        let cs = self.v.find_case_sensitive();
+        self.v.set_find(&self.doc, query, cs, true)
+    }
+
+    /// The find bar's `Aa` toggle: match case on/off, re-running the current query.
+    pub fn set_find_case_sensitive(&mut self, on: bool) -> FindStatus {
+        self.v.set_find_case(&self.doc, on)
     }
 
     pub fn find_next(&mut self) -> FindStatus {
-        FindStatus::default()
+        self.v.find_step(true)
     }
 
     pub fn find_prev(&mut self) -> FindStatus {
-        FindStatus::default()
+        self.v.find_step(false)
     }
 
+    /// Current find state (e.g. after a live reload re-ran the query).
+    pub fn find_status(&self) -> FindStatus {
+        self.v.find_status()
+    }
+
+    /// Ends find: clears matches and highlights (the match-case setting is kept).
     pub fn clear_find(&mut self) {
-        self.find_query.clear();
+        self.v.clear_find();
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.v.has_selection()
+    }
+
+    /// The current text selection as plain text (what Ctrl+C copies), e.g. to pre-fill find.
+    pub fn selected_text(&self) -> Option<String> {
+        let t = self.v.selected_text(&self.doc);
+        (!t.is_empty()).then_some(t)
+    }
+
+    /// Esc in the find bar: the current match becomes the text selection (best effort).
+    pub fn select_current_match(&mut self) {
+        self.v.select_current_match();
+    }
+
+    pub fn select_all(&mut self) {
+        self.v.select_all(&self.doc);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.v.clear_selection();
+    }
+
+    /// CPU time of the last [`Self::show`] call, in seconds (benchmarks).
+    pub fn last_show_secs(&self) -> f64 {
+        self.v.last_show_secs
+    }
+
+    /// Every block has been laid out at the current width (layout runs progressively).
+    pub fn layout_complete(&self) -> bool {
+        self.v.layout_complete
     }
 }
