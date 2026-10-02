@@ -1,0 +1,17 @@
+[package]
+name = "cutemarkdown-engine"
+description = "Markdown document engine for cutemarkdown: parse, lay out and paint with egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "engine"
+
+[dependencies]
+egui.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+egui_extras.workspace = true
+image.workspace = true

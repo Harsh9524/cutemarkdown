@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="16" height="16">
+  <title>cutemarkdown (small)</title>
+  <!--
+    Small-size variant for 16-32 px. Drawn on a 16 px grid (16 units = 1 px at 16x16):
+    wider page (x 1-15 px, full height), smaller fold, 2 px strokes on whole-pixel
+    centres, solid triangle arrowhead so it stays separate from the outer legs.
+  -->
+  <defs>
+    <linearGradient id="cms-fill" x1="16" y1="0" x2="240" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E8558C"/>
+      <stop offset="1" stop-color="#6F5FEA"/>
+    </linearGradient>
+    <linearGradient id="cms-sheen" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="cms-flap" x1="176" y1="64" x2="240" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9D6EA"/>
+      <stop offset="1" stop-color="#FFF3F9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- page -->
+  <path fill="url(#cms-fill)" d="M56 0H168Q176 0 181.66 5.66L234.34 58.34Q240 64 240 72V216A40 40 0 0 1 200 256H56A40 40 0 0 1 16 216V40A40 40 0 0 1 56 0Z"/>
+  <path fill="url(#cms-sheen)" d="M56 0H168Q176 0 181.66 5.66L234.34 58.34Q240 64 240 72V216A40 40 0 0 1 200 256H56A40 40 0 0 1 16 216V40A40 40 0 0 1 56 0Z"/>
+
+  <!-- folded corner -->
+  <path fill="#3A1268" fill-opacity="0.22" transform="translate(-4 6)" d="M181.66 5.66L234.34 58.34Q240 64 232 64H192A16 16 0 0 1 176 48V8Q176 0 181.66 5.66Z"/>
+  <path fill="url(#cms-flap)" d="M181.66 5.66L234.34 58.34Q240 64 232 64H192A16 16 0 0 1 176 48V8Q176 0 181.66 5.66Z"/>
+
+  <!-- mark: m + down arrow -->
+  <g stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+    <path fill="none" stroke-width="32" d="M64 160V128A32 32 0 0 1 128 128A32 32 0 0 1 192 128V160M128 128V188"/>
+    <path fill="#FFFFFF" stroke-width="12" d="M98 182H158L128 218Z"/>
+  </g>
+</svg>

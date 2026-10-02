@@ -1,0 +1,48 @@
+[workspace]
+members = [".", "crates/engine"]
+resolver = "3"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/harsh9524/cutemarkdown"
+
+[workspace.dependencies]
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "persistence", "x11", "wayland"] }
+egui_extras = { version = "0.36", features = ["file", "image", "svg", "http"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+[package]
+name = "cutemarkdown"
+description = "A fast, minimal, native Markdown reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cutemarkdown"
+path = "src/main.rs"
+
+[dependencies]
+engine = { package = "cutemarkdown-engine", path = "crates/engine" }
+egui.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+image.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Fast-enough dev builds: optimize dependencies, keep our own code debuggable.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>cutemarkdown</title>
+  <!--
+    cutemarkdown master icon (use for 40 px and up).
+    A soft page with a folded corner; on it, one continuous stroke draws a
+    lowercase "m" whose middle leg drops into a down arrow (Markdown's M + down
+    arrow, fused). The two arches over the arrow point also read as a quiet heart.
+  -->
+  <defs>
+    <linearGradient id="cm-fill" x1="30" y1="16" x2="226" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E8558C"/>
+      <stop offset="1" stop-color="#6F5FEA"/>
+    </linearGradient>
+    <linearGradient id="cm-sheen" x1="0" y1="16" x2="0" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="0.55" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#2A0F55" stop-opacity="0.10"/>
+    </linearGradient>
+    <linearGradient id="cm-flap" x1="162" y1="80" x2="226" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F9D6EA"/>
+      <stop offset="1" stop-color="#FFF3F9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- page -->
+  <path fill="url(#cm-fill)" d="M70 16H154Q162 16 167.66 21.66L220.34 74.34Q226 80 226 88V200A40 40 0 0 1 186 240H70A40 40 0 0 1 30 200V56A40 40 0 0 1 70 16Z"/>
+  <path fill="url(#cm-sheen)" d="M70 16H154Q162 16 167.66 21.66L220.34 74.34Q226 80 226 88V200A40 40 0 0 1 186 240H70A40 40 0 0 1 30 200V56A40 40 0 0 1 70 16Z"/>
+
+  <!-- folded corner: soft shadow, then flap -->
+  <path fill="#3A1268" fill-opacity="0.20" transform="translate(-3 5)" d="M167.66 21.66L220.34 74.34Q226 80 218 80H182A20 20 0 0 1 162 60V24Q162 16 167.66 21.66Z"/>
+  <path fill="url(#cm-flap)" d="M167.66 21.66L220.34 74.34Q226 80 218 80H182A20 20 0 0 1 162 60V24Q162 16 167.66 21.66Z"/>
+
+  <!-- mark: m + down arrow, one stroke family -->
+  <g fill="none" stroke-width="22" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#3A1268" stroke-opacity="0.16" transform="translate(0 4)">
+      <path d="M84 170V136A22 22 0 0 1 128 136A22 22 0 0 1 172 136V170M128 136V210M110 192L128 210L146 192"/>
+    </g>
+    <g stroke="#FFFFFF">
+      <path d="M84 170V136A22 22 0 0 1 128 136A22 22 0 0 1 172 136V170M128 136V210M110 192L128 210L146 192"/>
+    </g>
+  </g>
+</svg>
