@@ -163,7 +163,7 @@ Total ≈ 2.5 MB raw, **≈ 1.34 MB in the binary**. Literata and Noto Emoji are
 | UI text (not scaled) | 13 (menus 13.5, labels 12, overlines 11) | 1.4 | 400–600 | +0.005em; overlines +0.08em | `text` / `muted` | — |
 
 - **Serif mode.** Paragraphs, list items, blockquotes, table cells and footnotes use Literata at T+1 with a 28 px line (1.65). Headings, UI and code don't change, so sans headings over serif text keep a strong hierarchy.
-- **Rhythm.** The gap between two blocks is max(previous.below, next.above); margins collapse, never add. A heading that directly follows another heading gets 12 px above it. Boxed blocks (code, tables, alerts, quotes, images, details) use 20 px.
+- **Rhythm.** The gap between two blocks is max(previous.below, next.above); margins collapse, never add. Two exceptions: a heading that directly follows another heading gets 12 px above it, and the block right after a heading gets the heading's own space below (so the ≥ 2.5× rule holds whatever follows). Boxed blocks (code, tables, alerts, quotes, images, details) use 20 px.
 - **Text size steps:** 12, 13, 14, 15, **16**, 17, 18, 20, 22, 24, 26, 28. All em values follow T.
 - **Keeping hierarchy clear in heading-heavy AI docs:**
   - Each heading level differs from its neighbors in at least two of size, weight, case and rule.

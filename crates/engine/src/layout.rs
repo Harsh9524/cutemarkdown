@@ -42,6 +42,13 @@ pub enum DecoKind {
     Mark,
     /// Line (rect is the 1 px line) in this color.
     Line(Color32),
+    /// A status circle or square (🟡, 🟥, ⚪ …) painted as a solid shape over its transparent
+    /// glyph, with an optional ring for the white ones.
+    Dot {
+        color: Color32,
+        square: bool,
+        ring: Option<Color32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -94,15 +101,47 @@ pub struct TextItem {
     /// Char index of the galley's first char within the run (code split per line when
     /// wrapping); 0 otherwise.
     pub char_base: usize,
+    /// [`row_starts`] of the galley (computed once; painting selections and find matches
+    /// needs it every frame).
+    pub starts: Arc<[usize]>,
+    /// A chunk of a huge code block, shaped only while it is on screen: `galley` is then an
+    /// empty placeholder and the view lays out `lazy.job` when it needs the glyphs.
+    pub lazy: Option<Arc<LazyGalley>>,
     /// Decorations, galley-relative.
     pub decos: Vec<Deco>,
     pub links: Vec<LinkRange>,
     pub objects: Vec<ObjPlace>,
 }
 
+/// What a lazily shaped text item needs: its layout job and its galley's (precomputed) rect.
+#[derive(Debug)]
+pub struct LazyGalley {
+    pub job: LayoutJob,
+    pub rect: Rect,
+}
+
+/// Code blocks with more lines than this (and no wrapping) are split into chunks that are
+/// shaped only while visible, so memory follows the viewport, not the block (a 10 MB log in a
+/// fence would otherwise keep every glyph alive: SPEC principle 6).
+const LAZY_CODE_LINES: usize = 1000;
+const CODE_CHUNK_LINES: usize = 256;
+
 impl TextItem {
     pub fn rect(&self) -> Rect {
-        self.galley.rect.translate(self.pos.to_vec2())
+        let r = match &self.lazy {
+            Some(l) => l.rect,
+            None => self.galley.rect,
+        };
+        r.translate(self.pos.to_vec2())
+    }
+
+    /// The galley with glyphs: lazily shaped chunks are laid out now (egui's galley cache keeps
+    /// them while they are used every frame and drops them once they are not).
+    pub fn shaped(&self, ctx: &egui::Context) -> Arc<Galley> {
+        match &self.lazy {
+            Some(l) => ctx.fonts_mut(|f| f.layout_job(l.job.clone())),
+            None => self.galley.clone(),
+        }
     }
 
     /// Galley-relative baseline of a row (where glyphs visually sit).
@@ -265,6 +304,8 @@ pub struct Env<'a> {
     pub urgent: Cell<bool>,
     metrics: RefCell<HashMap<(FontFamily, u32), (f32, f32)>>,
     needs_highlight: Cell<bool>,
+    /// Laying out a footnote hover card: the note's "↩" back-link is left out.
+    note_card: Cell<bool>,
 }
 
 impl<'a> Env<'a> {
@@ -294,12 +335,20 @@ impl<'a> Env<'a> {
             urgent: Cell::new(false),
             metrics: RefCell::new(HashMap::new()),
             needs_highlight: Cell::new(false),
+            note_card: Cell::new(false),
         }
     }
 
     /// Spec px at T = 16 → content px.
     pub fn em(&self, px: f32) -> f32 {
         px * self.t / 16.0
+    }
+
+    /// Can a container indent its content by `indent` within width `w`? Deeply nested quotes,
+    /// lists and boxes stop indenting (and drawing bars and markers) once the text would get
+    /// narrower than 12 em, so their content stays readable at any depth.
+    fn can_indent(&self, w: f32, indent: f32) -> bool {
+        w - indent >= self.em(192.0).max(160.0)
     }
 
     /// (ascent, row height) of a family at a size.
@@ -586,6 +635,17 @@ impl Env<'_> {
     }
 }
 
+/// Colored circles and squares used as status markers (🟡, 🟥, ⚪ …): `Some(square)`.
+/// Monochrome emoji fonts draw them as faint hatched outlines, which reads as "empty" next to
+/// ✅ and ❌, so the engine paints them as solid shapes in their tint instead (SPEC §5).
+pub fn status_shape(c: char) -> Option<bool> {
+    match c {
+        '🟠' | '🟡' | '🟢' | '🟣' | '🟤' | '🔴' | '🔵' | '⚪' | '⚫' => Some(false),
+        '🟥' | '🟦' | '🟧' | '🟨' | '🟩' | '🟪' | '🟫' | '⬜' | '⬛' => Some(true),
+        _ => None,
+    }
+}
+
 /// Semantic tint for status emoji (SPEC §5).
 pub fn emoji_tint(c: char, pal: &Palette) -> Option<Color32> {
     let a = &pal.alert;
@@ -601,6 +661,7 @@ pub fn emoji_tint(c: char, pal: &Palette) -> Option<Color32> {
         '✨' | '⭐' | '🌟' | '❤' | '💖' => pal.accent,
         '⚪' | '⬜' => pal.faint,
         '⚫' | '⬛' => pal.text_strong,
+        '🟤' | '🟫' => pal.orange.lerp_to_gamma(Color32::BLACK, 0.35),
         _ => return None,
     })
 }
@@ -620,13 +681,22 @@ pub fn row_starts(galley: &Galley) -> Vec<usize> {
     out
 }
 
+/// Index of the row containing char `c` (the last row for `c` past the end).
+fn row_of(galley: &Galley, starts: &[usize], c: usize) -> usize {
+    let n = galley.rows.len().min(starts.len());
+    starts[..n].partition_point(|&s| s <= c).saturating_sub(1)
+}
+
 /// Per-row horizontal segments covering chars `range`: (row index, x0, x1), galley coords.
+/// Starts at the row containing `range.start`, so the cost is the rows covered (plus a binary
+/// search), not the galley's size.
 pub fn segments(galley: &Galley, starts: &[usize], range: Range<usize>) -> Vec<(usize, f32, f32)> {
     let mut out = Vec::new();
     if range.is_empty() {
         return out;
     }
-    for (ri, row) in galley.rows.iter().enumerate() {
+    let first = row_of(galley, starts, range.start);
+    for (ri, row) in galley.rows.iter().enumerate().skip(first) {
         let r0 = starts[ri];
         let n = row.glyphs.len();
         let r1 = r0 + n;
@@ -659,7 +729,8 @@ pub fn segments(galley: &Galley, starts: &[usize], range: Range<usize>) -> Vec<(
 
 /// Character → galley-relative rect of its glyph (for find/scroll targets).
 pub fn char_rect(galley: &Galley, starts: &[usize], c: usize) -> Rect {
-    for (ri, row) in galley.rows.iter().enumerate() {
+    let first = row_of(galley, starts, c);
+    for (ri, row) in galley.rows.iter().enumerate().skip(first) {
         let r0 = starts[ri];
         let r1 = starts[ri + 1];
         if c < r1 || ri + 1 == galley.rows.len() {
@@ -758,10 +829,17 @@ impl Env<'_> {
             HAlign::Right => Align::RIGHT,
         };
         let mut objs: Vec<ObjSlot> = Vec::new();
+        // Status shapes: (char index, char, font size).
+        let mut shapes: Vec<(usize, char, f32)> = Vec::new();
         // Char offsets of spans (galley chars == text chars).
         let mut span_chars: Vec<Range<usize>> = Vec::with_capacity(rt.spans.len());
         let mut chars = 0usize;
+        let note_card = self.note_card.get();
         for span in &rt.spans {
+            if note_card && span.flags & FOOTBACK != 0 {
+                span_chars.push(chars..chars);
+                continue;
+            }
             let text = &rt.text[span.range.clone()];
             let n = text.chars().count();
             span_chars.push(chars..chars + n);
@@ -784,7 +862,10 @@ impl Env<'_> {
                     } else {
                         text
                     };
-                    self.append_tinted(&mut job, text, fmt);
+                    let size = fmt.font_id.size;
+                    for (ci, c) in self.append_tinted(&mut job, text, fmt) {
+                        shapes.push((chars + ci, c, size));
+                    }
                 }
                 SpanKind::Pad(em) => {
                     let mut fmt = base_fmt.clone();
@@ -830,6 +911,7 @@ impl Env<'_> {
             }
         }
         let galley = self.galley(job);
+        let starts: Arc<[usize]> = row_starts(&galley).into();
         let anchor_x = match align {
             HAlign::Left => x,
             HAlign::Center => x + w / 2.0,
@@ -843,11 +925,12 @@ impl Env<'_> {
             line_h: base.line_h,
             run,
             char_base: 0,
+            starts: starts.clone(),
+            lazy: None,
             decos: Vec::new(),
             links: Vec::new(),
             objects: Vec::new(),
         };
-        let starts = row_starts(&item.galley);
         let g = item.galley.clone();
         let line_h = base.line_h;
         let row_line_box = |ri: usize| -> (f32, f32, f32) {
@@ -858,27 +941,67 @@ impl Env<'_> {
         };
         let xh = base.size * if base.serif { 0.507 } else { 0.546 };
 
-        // Decorations by span flags.
+        // Inline code chips and keycaps: one box per element (its pads included), so the text
+        // sits centered with the same padding on both sides (SPEC §6).
+        let chip_kind = |f: u16| match () {
+            _ if f & KBD != 0 => Some(DecoKind::Kbd),
+            _ if f & CODE != 0 => Some(DecoKind::CodeBg),
+            _ => None,
+        };
+        let mut si = 0;
+        while si < rt.spans.len() {
+            let Some(kind) = chip_kind(rt.spans[si].flags) else {
+                si += 1;
+                continue;
+            };
+            // The element runs to its closing pad (`<kbd>a</kbd><kbd>b</kbd>` is two keys).
+            let mut sj = si + 1;
+            while sj < rt.spans.len() && chip_kind(rt.spans[sj].flags) == Some(kind) {
+                let closing = matches!(rt.spans[sj].kind, SpanKind::Pad(_))
+                    && matches!(rt.spans.get(sj + 1).map(|s| s.kind), Some(SpanKind::Pad(_)));
+                sj += 1;
+                if closing {
+                    break;
+                }
+            }
+            let range = span_chars[si].start..span_chars[sj - 1].end;
+            // egui places a pad marker after its leading space, so the opening pad lies left of
+            // the first segment, except at the start of a wrapped row, where egui drops it.
+            let lead = match rt.spans[si].kind {
+                SpanKind::Pad(em) => em * base.size,
+                _ => 0.0,
+            };
+            for (k, (ri, mut x0, x1)) in
+                segments(&g, &starts, range.clone()).into_iter().enumerate()
+            {
+                let wrapped_start =
+                    ri > 0 && starts[ri] == range.start && !g.rows[ri - 1].ends_with_newline;
+                if k == 0 && !wrapped_start {
+                    x0 -= lead;
+                }
+                let (top, bottom, bl) = row_line_box(ri);
+                let rect = if kind == DecoKind::Kbd {
+                    let h = base.size * 0.8 * 1.21 + 4.0;
+                    let cy = bl - base.size * 0.29;
+                    Rect::from_min_max(pos2(x0, cy - h / 2.0), pos2(x1, cy + h / 2.0))
+                } else {
+                    Rect::from_min_max(pos2(x0, top + 2.0), pos2(x1, bottom - 2.0))
+                };
+                item.decos.push(Deco { rect, kind });
+            }
+            si = sj;
+        }
+        // Other decorations by span flags.
         for (si, span) in rt.spans.iter().enumerate() {
             let range = span_chars[si].clone();
             let f = span.flags;
-            if f & (CODE | KBD | MARK | STRIKE | UNDERLINE) == 0 {
+            if f & (MARK | STRIKE | UNDERLINE) == 0 {
                 continue;
             }
             for (ri, x0, x1) in segments(&g, &starts, range.clone()) {
                 let (top, bottom, bl) = row_line_box(ri);
-                if f & KBD != 0 {
-                    let h = base.size * 0.8 * 1.21 + 4.0;
-                    let cy = bl - base.size * 0.29;
-                    item.decos.push(Deco {
-                        rect: Rect::from_min_max(pos2(x0, cy - h / 2.0), pos2(x1, cy + h / 2.0)),
-                        kind: DecoKind::Kbd,
-                    });
-                } else if f & CODE != 0 {
-                    item.decos.push(Deco {
-                        rect: Rect::from_min_max(pos2(x0, top + 2.0), pos2(x1, bottom - 2.0)),
-                        kind: DecoKind::CodeBg,
-                    });
+                if f & (KBD | CODE) != 0 {
+                    // Boxed above.
                 } else if f & MARK != 0 {
                     item.decos.push(Deco {
                         rect: Rect::from_min_max(
@@ -903,6 +1026,28 @@ impl Env<'_> {
                     });
                 }
             }
+        }
+        // Status shapes: sitting on the baseline, cap-height tall, centered in the glyph's box.
+        for (ci, c, size) in shapes {
+            let Some(&(ri, x0, x1)) = segments(&g, &starts, ci..ci + 1).first() else {
+                continue;
+            };
+            let (_, _, bl) = row_line_box(ri);
+            let d = (0.72 * size).round();
+            let square = status_shape(c).unwrap_or(false);
+            let rect = Rect::from_center_size(
+                pos2((x0 + x1) / 2.0, bl - d / 2.0),
+                Vec2::splat(if square { d * 0.92 } else { d }),
+            );
+            let white = matches!(c, '⚪' | '⬜');
+            item.decos.push(Deco {
+                rect,
+                kind: DecoKind::Dot {
+                    color: emoji_tint(c, self.pal).unwrap_or(self.pal.muted),
+                    square,
+                    ring: white.then_some(self.pal.muted),
+                },
+            });
         }
         // Links (merge adjacent spans of the same link).
         let mut li = 0;
@@ -965,14 +1110,27 @@ impl Env<'_> {
         item
     }
 
-    /// Append text, giving status emoji their semantic tint.
-    fn append_tinted(&self, job: &mut LayoutJob, text: &str, fmt: TextFormat) {
+    /// Append text, giving status emoji their semantic tint. Status circles and squares are
+    /// appended transparent; returns their (char index in `text`, char) to paint as shapes.
+    fn append_tinted(
+        &self,
+        job: &mut LayoutJob,
+        text: &str,
+        fmt: TextFormat,
+    ) -> Vec<(usize, char)> {
+        let mut shapes = Vec::new();
         let mut last = 0;
-        for (i, c) in text.char_indices() {
+        for (ci, (i, c)) in text.char_indices().enumerate() {
             if (c as u32) < 0x2000 {
                 continue;
             }
-            if let Some(tint) = emoji_tint(c, self.pal) {
+            let tint = if status_shape(c).is_some() {
+                shapes.push((ci, c));
+                Some(Color32::TRANSPARENT)
+            } else {
+                emoji_tint(c, self.pal)
+            };
+            if let Some(tint) = tint {
                 if i > last {
                     job.append(&text[last..i], 0.0, fmt.clone());
                 }
@@ -990,6 +1148,7 @@ impl Env<'_> {
         if last < text.len() {
             job.append(&text[last..], 0.0, fmt);
         }
+        shapes
     }
 }
 
@@ -1076,13 +1235,18 @@ pub fn is_heading(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::Heading { .. })
 }
 
-/// Gap between two consecutive blocks (margins collapse; heading after heading gets 12).
+/// Gap between two consecutive blocks (SPEC §4 Rhythm): margins collapse, except that a
+/// heading after a heading gets 12, and whatever follows a heading gets the heading's own space
+/// below, so the heading sits ≥ 2.5× closer to its content than to what precedes it.
 pub fn gap(prev: &BlockKind, next: &BlockKind, t: f32) -> f32 {
     if matches!(next, BlockKind::Anchor(_)) || matches!(prev, BlockKind::Anchor(_)) {
         return 0.0;
     }
     if is_heading(prev) && is_heading(next) {
         return 12.0 * t / 16.0;
+    }
+    if is_heading(prev) {
+        return margins(prev, t).1;
     }
     margins(prev, t).1.max(margins(next, t).0)
 }
@@ -1111,7 +1275,21 @@ pub fn layout_note(env: &Env, blocks: &[Block], w: f32) -> LBlock {
     ctx.small = true;
     ctx.in_item = true;
     ctx.tight = true;
+    // The "↩" back-link points at the reference under the pointer: not part of the note.
+    let back_only = |b: &Block| match &b.kind {
+        BlockKind::Paragraph { run, .. } => env.texts[*run as usize]
+            .spans
+            .iter()
+            .all(|s| s.flags & flags::FOOTBACK != 0),
+        _ => false,
+    };
+    let blocks = match blocks.split_last() {
+        Some((last, rest)) if back_only(last) => rest,
+        _ => blocks,
+    };
+    env.note_card.set(true);
     env.children(blocks, 0.0, w, &ctx, &mut out, &mut y);
+    env.note_card.set(false);
     LBlock {
         height: y.max(0.0),
         items: out.items,
@@ -1221,13 +1399,17 @@ impl Env<'_> {
                 inner.color = self.pal.text_2;
                 inner.in_item = false;
                 let bar_w = 3.0;
-                let gap = self.em(16.0);
-                self.children(blocks, x + bar_w + gap, w - bar_w - gap, &inner, out, y);
-                out.items.push(Item::Fill {
-                    rect: Rect::from_min_max(pos2(x, top), pos2(x + bar_w, *y)),
-                    color: self.pal.quote_bar,
-                    radius: CornerRadius::same(1),
-                });
+                let indent = bar_w + self.em(16.0);
+                if self.can_indent(w, indent) {
+                    self.children(blocks, x + indent, w - indent, &inner, out, y);
+                    out.items.push(Item::Fill {
+                        rect: Rect::from_min_max(pos2(x, top), pos2(x + bar_w, *y)),
+                        color: self.pal.quote_bar,
+                        radius: CornerRadius::same(1),
+                    });
+                } else {
+                    self.children(blocks, x, w, &inner, out, y);
+                }
             }
             BlockKind::Alert { kind, blocks } => self.alert(*kind, blocks, x, w, ctx, out, y),
             BlockKind::Table(t) => self.table(t, b.id, x, w, out, y),
@@ -1385,7 +1567,7 @@ impl Env<'_> {
         let spans = hl.as_ref().map_or(&no_spans, |h| &h.spans);
         // Galley for a byte range of the code, highlight spans clipped to it. `lead` is the
         // first section's leading space (negative for hanging indents).
-        let build = |range: Range<usize>, lead: f32, wrap: f32| -> Arc<Galley> {
+        let job_for = |range: Range<usize>, lead: f32, wrap: f32| -> LayoutJob {
             let mut job = LayoutJob {
                 break_on_newline: true,
                 ..Default::default()
@@ -1418,36 +1600,138 @@ impl Env<'_> {
                     format: fmt(pal.text),
                 });
             }
-            self.galley(job)
+            job
+        };
+        let build = |range: Range<usize>, lead: f32, wrap: f32| -> Arc<Galley> {
+            self.galley(job_for(range, lead, wrap))
         };
         let inner_w = (w - 2.0 * pad_x).max(10.0);
         let code_top = top + header_h + pad_t;
-        // (galley, x offset, y, char base, source line index)
-        let mut pieces: Vec<(Arc<Galley>, f32, f32, usize, usize)> = Vec::new();
+        // (galley, x offset, y, char base, row starts, lazy chunk)
+        type Piece = (
+            Arc<Galley>,
+            f32,
+            f32,
+            usize,
+            Option<Arc<[usize]>>,
+            Option<Arc<LazyGalley>>,
+        );
+        let mut pieces: Vec<Piece> = Vec::new();
+        let n_lines = text.bytes().filter(|&b| b == b'\n').count() + 1;
+        // Huge blocks are shaped lazily (see LAZY_CODE_LINES): their geometry comes from glyph
+        // advances (monospace), so nothing is shaped for lines off screen.
+        let lazy = n_lines > LAZY_CODE_LINES;
+        let placeholder = lazy.then(|| build(0..0, 0.0, f32::INFINITY));
+        let font_id = FontId::new(size, family.clone());
+        let ascii_w: Vec<f32> = if lazy {
+            self.ctx.fonts_mut(|f| {
+                (0u8..128)
+                    .map(|b| f.glyph_width(&font_id, b as char))
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        let mut other_w: HashMap<char, f32> = HashMap::new();
+        let mut line_w = |l: &str| -> f32 {
+            if l.is_ascii() {
+                return l.bytes().map(|b| ascii_w[b as usize]).sum();
+            }
+            self.ctx.fonts_mut(|f| {
+                l.chars()
+                    .map(|c| match c.is_ascii() {
+                        true => ascii_w[c as usize],
+                        false => *other_w
+                            .entry(c)
+                            .or_insert_with(|| f.glyph_width(&font_id, c)),
+                    })
+                    .sum()
+            })
+        };
         if self.wrap_code {
             // One galley per source line; continuation rows are indented to the line's
             // leading whitespace + 2ch (the first row starts that far to the left).
-            let char_w = self
-                .ctx
-                .fonts_mut(|f| f.glyph_width(&FontId::new(size, family.clone()), ' '));
+            let char_w = self.ctx.fonts_mut(|f| f.glyph_width(&font_id, ' '));
             let (mut yy, mut base, mut byte) = (code_top, 0usize, 0usize);
-            for (li, line) in text.split('\n').enumerate() {
+            for line in text.split('\n') {
                 let cols: usize = line
                     .chars()
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .map(|c| if c == '\t' { 4 } else { 1 })
                     .sum();
                 let indent = ((cols + 2) as f32 * char_w).min(inner_w * 0.5);
-                let g = build(
-                    byte..byte + line.len(),
-                    -indent,
-                    (inner_w - indent).max(40.0),
-                );
-                let h = g.rect.height().max(line_h);
-                pieces.push((g, indent, yy, base, li));
+                let wrap = (inner_w - indent).max(40.0);
+                let range = byte..byte + line.len();
+                let n_chars = line.chars().count();
+                let h = if let Some(ph) = &placeholder {
+                    let job = job_for(range, -indent, wrap);
+                    let est = line_w(line);
+                    let (rect, starts) = if est - indent <= wrap - 1.0 {
+                        // (The first row starts `indent` to the left; egui's galley rect also
+                        // spans the origin.)
+                        let r =
+                            Rect::from_min_max(Pos2::ZERO, pos2((est - indent).max(0.0), line_h));
+                        (r, vec![0, n_chars])
+                    } else {
+                        // It wraps: shape it once to count its rows, without keeping the glyphs
+                        // (egui's cache would hold every line until the end of the frame).
+                        let job = Arc::new(job.clone());
+                        let g = self
+                            .ctx
+                            .fonts_mut(|f| egui::epaint::text::layout(f.fonts, self.ppp, job));
+                        (g.rect, row_starts(&g))
+                    };
+                    let lz = LazyGalley { job, rect };
+                    pieces.push((
+                        ph.clone(),
+                        indent,
+                        yy,
+                        base,
+                        Some(starts.into()),
+                        Some(Arc::new(lz)),
+                    ));
+                    rect.height().max(line_h)
+                } else {
+                    let g = build(range, -indent, wrap);
+                    let h = g.rect.height().max(line_h);
+                    pieces.push((g, indent, yy, base, None, None));
+                    h
+                };
                 yy += h;
-                base += line.chars().count() + 1;
+                base += n_chars + 1;
                 byte += line.len() + 1;
+            }
+        } else if let Some(ph) = &placeholder {
+            // One row per line, each `line_h` tall: chunk geometry is known without shaping.
+            let lines: Vec<&str> = text.split('\n').collect();
+            let (mut yy, mut base, mut byte) = (code_top, 0usize, 0usize);
+            for chunk in lines.chunks(CODE_CHUNK_LINES) {
+                let bytes = chunk.iter().map(|l| l.len() + 1).sum::<usize>() - 1;
+                let mut starts = Vec::with_capacity(chunk.len() + 1);
+                let (mut chars, mut width) = (0usize, 0.0f32);
+                for (k, l) in chunk.iter().enumerate() {
+                    starts.push(chars);
+                    chars += l.chars().count() + usize::from(k + 1 < chunk.len());
+                    width = width.max(line_w(l));
+                }
+                starts.push(chars);
+                let h = chunk.len() as f32 * line_h;
+                let lz = LazyGalley {
+                    job: job_for(byte..byte + bytes, 0.0, f32::INFINITY),
+                    // A little slack: shaping can round differently from summed advances.
+                    rect: Rect::from_min_size(Pos2::ZERO, vec2(width.ceil() + 2.0, h)),
+                };
+                pieces.push((
+                    ph.clone(),
+                    0.0,
+                    yy,
+                    base,
+                    Some(starts.into()),
+                    Some(Arc::new(lz)),
+                ));
+                yy += h;
+                base += chars + 1;
+                byte += bytes + 1;
             }
         } else {
             pieces.push((
@@ -1455,12 +1739,14 @@ impl Env<'_> {
                 0.0,
                 code_top,
                 0,
-                0,
+                None,
+                None,
             ));
         }
-        let code_h = pieces.last().map_or(line_h, |(g, _, yy, _, _)| {
-            yy + g.rect.height().max(line_h) - code_top
-        });
+        let piece_size = |(g, .., lazy): &Piece| lazy.as_ref().map_or(g.rect, |l| l.rect).size();
+        let code_h = pieces
+            .last()
+            .map_or(line_h, |p| p.2 + piece_size(p).y.max(line_h) - code_top);
         let total_h = header_h + pad_t + code_h + pad_b;
         let frame = Rect::from_min_size(pos2(x, top), vec2(w, total_h));
         out.items.push(Item::Fill {
@@ -1490,10 +1776,7 @@ impl Env<'_> {
             pos2(x + 1.0, top + header_h),
             pos2(x + w - 1.0, top + total_h - 1.0),
         );
-        let widest = pieces
-            .iter()
-            .map(|(g, ..)| g.rect.width())
-            .fold(0.0, f32::max);
+        let widest = pieces.iter().map(|p| piece_size(p).x).fold(0.0, f32::max);
         let content_w = if self.wrap_code {
             area.width()
         } else {
@@ -1503,22 +1786,14 @@ impl Env<'_> {
         if let Some(h) = &hl {
             for (line, kind) in &h.line_bg {
                 let line = *line as usize;
-                // (y top, y bottom) of the source line.
+                // (y top, y bottom) of the source line: unwrapped, every line is one row.
                 let span = if self.wrap_code {
                     pieces
                         .get(line)
-                        .map(|(g, _, yy, _, _)| (*yy, yy + g.rect.height().max(line_h)))
+                        .map(|(g, _, yy, ..)| (*yy, yy + g.rect.height().max(line_h)))
                 } else {
-                    let (g, _, yy, _, _) = &pieces[0];
-                    let starts = row_starts(g);
-                    let byte = text
-                        .split('\n')
-                        .take(line)
-                        .map(|l| l.len() + 1)
-                        .sum::<usize>();
-                    let ch = text[..byte.min(text.len())].chars().count();
-                    let r = char_rect(g, &starts, ch);
-                    Some((yy + r.top(), yy + r.bottom()))
+                    let y0 = code_top + line as f32 * line_h;
+                    Some((y0, y0 + line_h))
                 };
                 let Some((y0, y1)) = span else { continue };
                 let color = match kind {
@@ -1532,7 +1807,8 @@ impl Env<'_> {
                 });
             }
         }
-        for (galley, indent, yy, base, _) in pieces {
+        for (galley, indent, yy, base, starts, lazy) in pieces {
+            let starts = starts.unwrap_or_else(|| row_starts(&galley).into());
             items.push(Item::Text(TextItem {
                 pos: pos2(pad_x - 1.0 + indent, yy),
                 galley,
@@ -1541,6 +1817,8 @@ impl Env<'_> {
                 line_h,
                 run: c.run,
                 char_base: base,
+                starts,
+                lazy,
                 decos: Vec::new(),
                 links: Vec::new(),
                 objects: Vec::new(),
@@ -1582,7 +1860,7 @@ impl Env<'_> {
 
     fn list(&self, l: &List, x: f32, w: f32, ctx: &Ctx, out: &mut Out, y: &mut f32) {
         let pal = self.pal;
-        let level = ctx.list_depth + 1;
+        let level = ctx.list_depth.saturating_add(1);
         let base = self.body(ctx);
         let num_size = base.size;
         let num_family = self.family_for(&base, 500, false, true);
@@ -1611,7 +1889,17 @@ impl Env<'_> {
         } else {
             self.em(26.0)
         };
-        let marker_x = x + self.em(10.0);
+        // Too deep to indent further: the items' text continues at this level's left edge,
+        // without markers (they would overlap the text).
+        let markers = self.can_indent(w, box_w);
+        let box_w = if markers { box_w } else { 0.0 };
+        // Bullets and checkboxes sit 16 px before the text (centered at x = 10 in a 26 px box,
+        // and still 16 px before the text when deep levels indent only 18 px).
+        let marker_x = if l.ordered || !markers {
+            x + self.em(10.0)
+        } else {
+            x + box_w - self.em(16.0)
+        };
         let item_gap = if l.tight { self.em(4.0) } else { self.em(12.0) };
         for (i, it) in l.items.iter().enumerate() {
             if i > 0 {
@@ -1649,7 +1937,8 @@ impl Env<'_> {
                         start_y + base.line_h,
                     )));
                 }
-                if matches!(b.kind, BlockKind::List(_))
+                if markers
+                    && matches!(b.kind, BlockKind::List(_))
                     && let Some((_, _, fl_bottom)) = first_line
                 {
                     out.items.push(Item::Fill {
@@ -1674,12 +1963,17 @@ impl Env<'_> {
             let _ = first_item_index;
             let xh = base.size * if base.serif { 0.507 } else { 0.546 };
             let mid = baseline - xh / 2.0;
+            if !markers {
+                continue;
+            }
             if let Some(checked) = it.task {
+                // Centered on the x-height, kept within the first row, which can be shorter
+                // than the box (a superscript-only line): then it hangs from the row's top.
                 let s = self.em(15.0);
-                let rect = Rect::from_center_size(
-                    pos2(marker_x, mid.clamp(row_top + s / 2.0, row_bottom - s / 2.0)),
-                    Vec2::splat(s),
-                );
+                let lo = row_top + s / 2.0;
+                let hi = (row_bottom - s / 2.0).max(lo);
+                let rect =
+                    Rect::from_center_size(pos2(marker_x, mid.clamp(lo, hi)), Vec2::splat(s));
                 out.items.push(Item::Checkbox { rect, checked });
             } else if l.ordered {
                 let g = num_galleys[i].clone();
@@ -1772,14 +2066,12 @@ impl Env<'_> {
         let mut inner = ctx.clone();
         inner.color = pal.text;
         inner.in_item = false;
-        self.children(
-            blocks,
-            x + pad_x + 1.0,
-            w - 2.0 * pad_x - 2.0,
-            &inner,
-            out,
-            y,
-        );
+        let pad = if self.can_indent(w, 2.0 * pad_x + 2.0) {
+            pad_x + 1.0
+        } else {
+            0.0
+        };
+        self.children(blocks, x + pad, w - 2.0 * pad, &inner, out, y);
         *y += pad_y;
         let rect = Rect::from_min_max(pos2(x, top), pos2(x + w, *y));
         out.items[fill_index] = Item::Fill {
@@ -1801,7 +2093,10 @@ impl Env<'_> {
         let pad_y = self.em(8.0);
         let hb = self.cell_base(true);
         let bb = self.cell_base(false);
-        // Measure natural and longest-word widths.
+        // Measure natural and longest-word widths. A word counts with the space after it: egui
+        // only breaks after a space that fits on the row, so a column exactly as wide as its
+        // longest word would push that space onto a row of its own (a blank line, then the
+        // next word indented by a space).
         let mut min_w = vec![0.0f32; ncols];
         let mut max_w = vec![0.0f32; ncols];
         let measure =
@@ -1815,7 +2110,7 @@ impl Env<'_> {
                     for gl in &row.glyphs {
                         if gl.chr.is_whitespace() {
                             if let Some(s) = start.take() {
-                                longest = longest.max(gl.pos.x - s);
+                                longest = longest.max(gl.max_x() - s);
                             }
                         } else if start.is_none() {
                             start = Some(gl.pos.x);
@@ -1826,7 +2121,8 @@ impl Env<'_> {
                     }
                 }
                 max_w[col] = max_w[col].max(natural.min(self.em(420.0)));
-                min_w[col] = min_w[col].max(longest.min(self.em(240.0)));
+                // Rounded up so float noise in the wrapped layout can't break the word early.
+                min_w[col] = min_w[col].max((longest.ceil() + 1.0).min(self.em(240.0)));
             };
         for (c, &run) in t.header.iter().enumerate().take(ncols) {
             measure(run, &hb, c, &mut min_w, &mut max_w);
@@ -2018,14 +2314,12 @@ impl Env<'_> {
             *y += self.em(10.0);
             let mut inner = ctx.clone();
             inner.in_item = false;
-            self.children(
-                blocks,
-                x + pad_x + 1.0,
-                w - 2.0 * pad_x - 2.0,
-                &inner,
-                out,
-                y,
-            );
+            let pad = if self.can_indent(w, 2.0 * pad_x + 2.0) {
+                pad_x + 1.0
+            } else {
+                0.0
+            };
+            self.children(blocks, x + pad, w - 2.0 * pad, &inner, out, y);
             *y += self.em(4.0);
         }
         *y += pad_y;
@@ -2211,4 +2505,459 @@ fn first_text_line(items: &[Item]) -> Option<(f32, f32, f32)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{self, Parsed};
+
+    /// Run `f` with the parsed `src` and a layout environment at text size `t`.
+    fn with_env<R>(src: &str, t: f32, f: impl FnOnce(&Parsed, &Env) -> R) -> (Parsed, R) {
+        with_env_wrap(src, t, false, f)
+    }
+
+    fn with_env_wrap<R>(
+        src: &str,
+        t: f32,
+        wrap_code: bool,
+        f: impl FnOnce(&Parsed, &Env) -> R,
+    ) -> (Parsed, R) {
+        let p = parse::parse(src, None);
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+        let pal = Palette::light();
+        let (images, toggled) = (HashMap::new(), HashSet::new());
+        let env = Env::new(
+            &ctx,
+            &pal,
+            t,
+            false,
+            wrap_code,
+            &p.texts,
+            &p.headings,
+            &images,
+            &toggled,
+        );
+        let r = f(&p, &env);
+        drop(env);
+        (p, r)
+    }
+
+    /// Lay out every top-level block of `src` at text size `t` and column width `w`.
+    fn layout_doc(src: &str, t: f32, w: f32) -> (Parsed, Vec<LBlock>) {
+        with_env(src, t, |p, env| {
+            p.blocks.iter().map(|b| layout_top(env, b, w)).collect()
+        })
+    }
+
+    fn galley_text(b: &LBlock) -> String {
+        let mut s = String::new();
+        for it in &b.items {
+            if let Item::Text(t) = it {
+                s.push_str(&t.galley.job.text);
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn footnote_card_leaves_out_the_back_link() {
+        for src in [
+            "See[^a].\n\n[^a]: The note text.\n",
+            "See[^a].\n\n[^a]:\n    ```\n    code\n    ```\n",
+        ] {
+            let (_, (card, section)) = with_env(src, 16.0, |p, env| {
+                let Some(BlockKind::Footnotes(notes)) = p
+                    .blocks
+                    .iter()
+                    .map(|b| &b.kind)
+                    .find(|k| matches!(k, BlockKind::Footnotes(_)))
+                else {
+                    panic!("no notes")
+                };
+                let card = layout_note(env, &notes[0].blocks, 300.0);
+                let section = layout_top(env, p.blocks.last().unwrap(), 600.0);
+                (card, section)
+            });
+            assert!(galley_text(&section).contains('↩'), "{src}");
+            assert!(!galley_text(&card).contains('↩'), "{src}");
+            assert!(card.height > 0.0);
+        }
+    }
+
+    fn text_items(b: &LBlock) -> Vec<&TextItem> {
+        b.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Galley x range of char `c` (row 0).
+    fn glyph_x(t: &TextItem, c: usize) -> (f32, f32) {
+        let row = &t.galley.rows[0];
+        let g = &row.glyphs[c];
+        (row.pos.x + g.pos.x, row.pos.x + g.max_x())
+    }
+
+    #[test]
+    fn code_chips_and_keycaps_are_centered_on_their_text() {
+        for (src, kind, pad) in [
+            ("a `xy` b", DecoKind::CodeBg, 5.0),
+            ("`xy` b", DecoKind::CodeBg, 5.0),
+            ("a <kbd>xy</kbd> b", DecoKind::Kbd, 7.0),
+        ] {
+            for t in [14.0, 16.0, 20.0] {
+                let (p, blocks) = layout_doc(src, t, 600.0);
+                let item = text_items(&blocks[0])[0];
+                let decos: Vec<_> = item.decos.iter().filter(|d| d.kind == kind).collect();
+                assert_eq!(decos.len(), 1, "{src}: one box per element");
+                let r = decos[0].rect;
+                let plain: Vec<char> = p.texts[0].text.chars().collect();
+                let first = plain.iter().position(|&c| c == 'x').unwrap();
+                let (x0, _) = glyph_x(item, first);
+                let (_, x1) = glyph_x(item, first + 1);
+                let (left, right) = (x0 - r.left(), r.right() - x1);
+                let want = pad * t / 16.0;
+                assert!(
+                    (left - want).abs() < 1.0 && (right - want).abs() < 1.0,
+                    "{src} at {t}: padding {left} left, {right} right, want {want}"
+                );
+            }
+        }
+        // Adjacent keys stay separate keycaps.
+        let (_, blocks) = layout_doc("<kbd>a</kbd><kbd>b</kbd>", 16.0, 600.0);
+        let n = text_items(&blocks[0])[0]
+            .decos
+            .iter()
+            .filter(|d| d.kind == DecoKind::Kbd)
+            .count();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn narrow_table_cells_wrap_between_words() {
+        let words = [
+            "alpha value long",
+            "beta value",
+            "gamma value",
+            "delta",
+            "epsilon value long",
+            "zeta x",
+            "eta value",
+            "theta",
+            "iota value",
+            "kappa value long",
+            "lambda v",
+            "mu value",
+        ];
+        let header: Vec<String> = (1..=12).map(|i| format!("Column {i}")).collect();
+        let src = format!(
+            "| {} |\n|{}\n| {} |\n",
+            header.join(" | "),
+            "---|".repeat(12),
+            words.join(" | ")
+        );
+        for (t, w) in [(16.0, 480.0), (16.0, 736.0), (14.0, 520.0), (20.0, 600.0)] {
+            let (_, blocks) = layout_doc(&src, t, w);
+            let Some(Item::Scroll(table)) = blocks[0]
+                .items
+                .iter()
+                .find(|i| matches!(i, Item::Scroll(_)))
+            else {
+                panic!("no table")
+            };
+            let mut cells = 0;
+            for it in &table.items {
+                let Item::Text(item) = it else { continue };
+                cells += 1;
+                for row in &item.galley.rows {
+                    let text: String = row.glyphs.iter().map(|g| g.chr).collect();
+                    assert!(
+                        !text.trim().is_empty() && !text.starts_with(char::is_whitespace),
+                        "{t}/{w}: row {text:?} of {:?}",
+                        item.galley.job.text
+                    );
+                }
+            }
+            assert_eq!(cells, 24);
+        }
+    }
+
+    #[test]
+    fn task_items_with_short_first_rows_lay_out_at_any_size() {
+        for src in [
+            "- [ ] <sup>1</sup>",
+            "1. [x] <sup>1</sup>",
+            "- [ ] <sup>1</sup><sup>2</sup>",
+            "- [ ] **<sup>1</sup>**",
+            "- [ ] <sub>1</sub>",
+        ] {
+            for t in 11..=28 {
+                let (_, blocks) = layout_doc(src, t as f32, 600.0);
+                let checkbox = blocks[0]
+                    .items
+                    .iter()
+                    .find_map(|i| match i {
+                        Item::Checkbox { rect, .. } => Some(*rect),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    checkbox.is_finite() && checkbox.width() > 0.0,
+                    "{src} at {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deep_bullets_keep_their_distance_from_the_text() {
+        let src: String = (0..7)
+            .map(|i| format!("{}- level {}\n", "  ".repeat(i), i + 1))
+            .collect();
+        let (_, blocks) = layout_doc(&src, 16.0, 600.0);
+        let mut texts = text_items(&blocks[0]);
+        texts.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
+        let mut markers: Vec<Pos2> = blocks[0]
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Circle { center, .. } => Some(*center),
+                Item::Fill { rect, .. } if rect.height() < 2.0 => Some(rect.center()),
+                _ => None,
+            })
+            .collect();
+        markers.sort_by(|a, b| a.y.total_cmp(&b.y));
+        assert_eq!(markers.len(), 7);
+        for (m, t) in markers.iter().zip(&texts) {
+            let gap = t.pos.x - m.x;
+            assert!(
+                (gap - 16.0).abs() < 0.5,
+                "marker {m:?}, text at {}",
+                t.pos.x
+            );
+        }
+    }
+
+    #[test]
+    fn segments_start_at_the_right_row() {
+        let src = "Lorem ipsum dolor sit amet, `code` consectetur adipiscing elit.  \nSed do \
+                   eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim \
+                   veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea.";
+        let (_, blocks) = layout_doc(src, 16.0, 200.0);
+        let t = text_items(&blocks[0])[0];
+        let (g, starts) = (&t.galley, &t.starts[..]);
+        assert!(g.rows.len() > 5);
+        assert_eq!(starts, &row_starts(g)[..]);
+        let n = *starts.last().unwrap();
+        for a in (0..n).step_by(7) {
+            for b in (a + 1..=n + 1).step_by(11) {
+                // Exactly the rows whose chars (newline included) overlap the range.
+                let want: Vec<usize> = (0..g.rows.len())
+                    .filter(|&ri| starts[ri] < b && a < starts[ri + 1])
+                    .collect();
+                let rows: Vec<usize> = segments(g, starts, a..b).iter().map(|s| s.0).collect();
+                assert_eq!(rows, want, "{a}..{b}");
+            }
+            let r = char_rect(g, starts, a);
+            let row = (0..g.rows.len()).find(|&i| a < starts[i + 1]).unwrap();
+            assert_eq!(r.top(), g.rows[row].pos.y);
+        }
+    }
+
+    #[test]
+    fn status_circles_are_solid_shapes() {
+        let (p, blocks) = layout_doc("🟡 Fallback, ✅ done, 🟥\u{FE0F} no", 16.0, 600.0);
+        assert!(
+            p.texts[0].plain().starts_with("🟡 Fallback"),
+            "copy text unchanged"
+        );
+        let item = text_items(&blocks[0])[0];
+        let dots: Vec<_> = item
+            .decos
+            .iter()
+            .filter_map(|d| match d.kind {
+                DecoKind::Dot { color, square, .. } => Some((d.rect, color, square)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dots.len(), 2, "✅ stays a glyph");
+        let pal = Palette::light();
+        assert_eq!(dots[0].1, pal.alert.warning.fg);
+        assert!(!dots[0].2 && dots[1].2);
+        // Inside the emoji's advance, cap-height tall.
+        let (x0, x1) = glyph_x(item, 0);
+        assert!(dots[0].0.left() >= x0 && dots[0].0.right() <= x1 + 0.5);
+        assert!((dots[0].0.height() - 11.5).abs() < 1.0);
+    }
+
+    #[test]
+    fn deep_nesting_stays_readable() {
+        let quotes: String = (0..100)
+            .map(|i| format!("{} q {i}\n{}\n", "> ".repeat(i + 1), ">".repeat(i + 1)))
+            .collect();
+        let list: String = (0..100)
+            .map(|i| format!("{}- item {i}\n", "  ".repeat(i)))
+            .collect();
+        let alerts: String = (0..40)
+            .map(|i| {
+                format!(
+                    "{}[!NOTE]\n{} note {i}\n",
+                    "> ".repeat(i + 1),
+                    "> ".repeat(i + 1)
+                )
+            })
+            .collect();
+        for src in [quotes, list, alerts] {
+            for w in [400.0, 736.0] {
+                let (_, blocks) = layout_doc(&src, 16.0, w);
+                for t in text_items(&blocks[0]) {
+                    let words = t.galley.job.text.split_whitespace().count();
+                    assert!(
+                        t.galley.rows.len() <= words.max(1),
+                        "{w}: {:?} broken into {} rows",
+                        t.galley.job.text,
+                        t.galley.rows.len()
+                    );
+                    assert!(t.pos.x <= w - 160.0, "{w}: text at x = {}", t.pos.x);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_code_blocks_are_shaped_lazily_in_chunks() {
+        let code: String = (0..3000)
+            .map(|i| format!("x{i} = foo({i}, \"bär\") # comment\n"))
+            .collect();
+        let src = format!("```\n{code}```\n");
+        let (_, chunks) = with_env(&src, 16.0, |p, env| {
+            let lb = layout_top(env, &p.blocks[0], 736.0);
+            let Some(Item::Scroll(s)) = lb.items.iter().find(|i| matches!(i, Item::Scroll(_)))
+            else {
+                panic!("no code area")
+            };
+            let chunks: Vec<TextItem> = s
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            // Geometry without shaping: one line_h per line, the frame fits them all.
+            let (_, line_h) = env.code_base();
+            let h: f32 = chunks.iter().map(|t| t.rect().height()).sum();
+            assert!((h - 3000.0 * line_h).abs() < 0.5, "{h}");
+            assert!(lb.height > h);
+            // Shaped on demand, the chunks match their precomputed rows and widths.
+            for t in &chunks {
+                let g = t.shaped(env.ctx);
+                assert_eq!(&t.starts[..], &row_starts(&g)[..]);
+                assert!(g.rect.width() <= t.rect().width() + 0.5);
+                assert!(g.rect.width() >= t.rect().width() - 4.0);
+                assert!((g.rect.height() - t.rect().height()).abs() < 0.5);
+            }
+            chunks
+        });
+        assert_eq!(chunks.len(), 3000_usize.div_ceil(CODE_CHUNK_LINES));
+        assert!(
+            chunks
+                .iter()
+                .all(|t| t.lazy.is_some() && t.galley.rows.len() <= 1)
+        );
+        // Char bases continue across chunks (the newline between them included).
+        let mut base = 0;
+        for t in &chunks {
+            assert_eq!(t.char_base, base);
+            base += t.starts.last().unwrap() + 1;
+        }
+        assert_eq!(base - 1, code.trim_end().chars().count());
+    }
+
+    #[test]
+    fn huge_wrapped_code_blocks_are_shaped_lazily_per_line() {
+        let code: String = (0..1500)
+            .map(|i| {
+                let tail = if i % 50 == 0 {
+                    " lots of words".repeat(20)
+                } else {
+                    String::new()
+                };
+                format!("    x{i} = foo({i}, \"bär\"){tail}\n")
+            })
+            .collect();
+        let src = format!("```\n{code}```\n");
+        // The same block laid out eagerly (as a smaller block would be) must match line by line.
+        with_env_wrap(&src, 16.0, true, |p, env| {
+            let lb = layout_top(env, &p.blocks[0], 600.0);
+            let Some(Item::Scroll(s)) = lb.items.iter().find(|i| matches!(i, Item::Scroll(_)))
+            else {
+                panic!("no code area")
+            };
+            let pieces: Vec<&TextItem> = s
+                .items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pieces.len(), 1500);
+            let mut y = pieces[0].pos.y;
+            for t in pieces {
+                assert!(t.lazy.is_some());
+                let g = t.shaped(env.ctx);
+                assert_eq!(&t.starts[..], &row_starts(&g)[..], "{:?}", g.job.text);
+                assert!((t.rect().height() - g.rect.height()).abs() < 0.5);
+                let (est, real) = (t.rect(), g.rect.translate(t.pos.to_vec2()));
+                assert!(
+                    (est.left() - real.left()).abs() < 0.5
+                        && (est.right() - real.right()).abs() < 2.5,
+                    "{est:?} vs {real:?} for {:?}",
+                    g.job.text
+                );
+                assert!((t.pos.y - y).abs() < 0.5);
+                y += t.rect().height();
+            }
+        });
+    }
+
+    #[test]
+    fn headings_belong_to_the_text_after_them() {
+        let t = 16.0;
+        let para = BlockKind::Paragraph {
+            run: 0,
+            align: HAlign::Left,
+        };
+        let followers = [
+            para.clone(),
+            BlockKind::Rule,
+            BlockKind::Quote(Vec::new()),
+            BlockKind::Footnotes(Vec::new()),
+        ];
+        for level in 1..=6 {
+            let h = BlockKind::Heading {
+                level,
+                run: 0,
+                index: 0,
+                align: HAlign::Left,
+            };
+            let above = gap(&para, &h, t);
+            assert_eq!(above, margins(&h, t).0);
+            for next in &followers {
+                let below = gap(&h, next, t);
+                assert!(
+                    above >= 2.5 * below,
+                    "H{level} then {next:?}: {above} above vs {below} below"
+                );
+            }
+        }
+    }
 }

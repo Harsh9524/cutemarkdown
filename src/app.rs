@@ -345,7 +345,8 @@ impl App {
     }
 
     fn follow_link(&mut self, ctx: &egui::Context, target: &LinkTarget, new_window: bool) {
-        match links::classify(target, links::probe) {
+        let doc_dir = self.doc.as_ref().and_then(|d| d.view.document().base_dir());
+        match links::classify_from(target, doc_dir, links::probe) {
             LinkAction::Anchor(a) => self.jump_to_anchor(&a),
             LinkAction::OpenDoc { path, anchor } => {
                 let same_doc = self
@@ -397,6 +398,9 @@ impl App {
                 if let Err(e) = platform::open_url(&u) {
                     self.toast(Toast::error(format!("Couldn't open link: {e}")));
                 }
+            }
+            LinkAction::Blocked(scheme) if scheme.is_empty() => {
+                self.toast(Toast::error("Blocked link"))
             }
             LinkAction::Blocked(scheme) => {
                 self.toast(Toast::error(format!("Blocked link ({scheme}:)")))

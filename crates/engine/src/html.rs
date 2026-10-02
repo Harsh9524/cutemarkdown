@@ -270,7 +270,13 @@ pub fn decode_entities(s: &str) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         rest = &rest[pos..];
-        let semi = rest[1..].find(';').map(|e| e + 1).filter(|&e| e <= 33);
+        // Entities are at most 32 chars: look no further for the `;` (linear, not quadratic,
+        // on text with many bare `&`).
+        let semi = rest.as_bytes()[1..]
+            .iter()
+            .take(33)
+            .position(|&b| b == b';')
+            .map(|e| e + 1);
         if let Some(semi) = semi {
             let ent = &rest[1..semi];
             if let Some(c) = decode_one(ent) {
@@ -430,6 +436,19 @@ pub fn is_safe_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entities_decode_in_linear_time() {
+        assert_eq!(decode_entities("a &amp; b &#x41;&#66; &lt"), "a & b AB &lt");
+        let far = format!("&{};", "a".repeat(40));
+        assert_eq!(decode_entities(&far), far, "no entity is that long");
+        assert_eq!(decode_entities("&é;&amp;"), "&é;&");
+        // Many bare `&` used to rescan the rest of the text for a `;` each time.
+        let amps = "&".repeat(400_000);
+        let t = std::time::Instant::now();
+        assert_eq!(decode_entities(&amps).len(), amps.len());
+        assert!(t.elapsed().as_secs_f64() < 1.0, "{:?}", t.elapsed());
+    }
 
     #[test]
     fn tags_and_text() {

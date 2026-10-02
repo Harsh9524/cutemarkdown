@@ -115,6 +115,22 @@ pub fn classify(target: &LinkTarget, probe: impl Fn(&Path) -> PathKind) -> LinkA
     }
 }
 
+/// [`classify`] for a link in a document from `doc_dir`: a file on another machine (a UNC path
+/// other than the document's own share) is blocked before anything touches the file system, so
+/// a click can't make Windows authenticate to a host the document names (SPEC §1.7).
+pub fn classify_from(
+    target: &LinkTarget,
+    doc_dir: Option<&Path>,
+    probe: impl Fn(&Path) -> PathKind,
+) -> LinkAction {
+    match target {
+        LinkTarget::File { path, .. } if engine::is_remote_path(path, doc_dir) => {
+            LinkAction::Blocked("file".into())
+        }
+        _ => classify(target, probe),
+    }
+}
+
 fn classify_file(
     path: &Path,
     anchor: Option<String>,
@@ -332,6 +348,26 @@ mod tests {
         assert_eq!(
             ext("https://evil\u{0}.com"),
             LinkAction::Blocked("https".into())
+        );
+    }
+
+    #[test]
+    fn remote_files_are_blocked_without_probing() {
+        let never = |p: &Path| -> PathKind { panic!("probed {}", p.display()) };
+        let unc = LinkTarget::File {
+            path: PathBuf::from(r"\\evil\share\a.md"),
+            anchor: None,
+        };
+        if cfg!(windows) {
+            assert_eq!(
+                classify_from(&unc, Some(&root()), never),
+                LinkAction::Blocked("file".into())
+            );
+        }
+        // Local files are classified as usual.
+        assert_eq!(
+            classify_from(&file("guide.md"), Some(&root()), fs()),
+            classify(&file("guide.md"), fs())
         );
     }
 

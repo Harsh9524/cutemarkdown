@@ -188,6 +188,18 @@ fn all_families() -> Vec<(FontFamily, Vec<String>)> {
     out
 }
 
+/// A family's bundled fonts in fallback order: its own fonts, then Noto Emoji, then JetBrains
+/// Mono for the symbols only the mono font has (box drawing, math operators, U+FFFD …).
+/// [`bundled_covers`] counts every bundled font, so every family must reach all of them:
+/// otherwise such a character would never get a system fallback and render as tofu.
+fn bundled_chain(fam: &FontFamily, mut list: Vec<String>) -> Vec<String> {
+    list.push(EMOJI_KEY.to_owned());
+    if *fam != FontFamily::Monospace {
+        list.push("jetbrains-mono".to_owned());
+    }
+    list
+}
+
 fn family_name_family(face: Face, w: u16) -> FontFamily {
     FontFamily::Name(family_name(face, w).into())
 }
@@ -237,8 +249,8 @@ pub fn install(ctx: &egui::Context) {
         defs.font_data.insert(name.clone(), data.clone());
     }
 
-    for (fam, mut list) in all_families() {
-        list.push(EMOJI_KEY.to_owned());
+    for (fam, list) in all_families() {
+        let mut list = bundled_chain(&fam, list);
         list.extend(loaded.iter().map(|(n, _)| n.clone()));
         defs.families.insert(fam, list);
     }
@@ -320,7 +332,9 @@ fn candidates() -> Vec<Candidate> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| "C:\\Windows".into())
             .join("Fonts");
-        // SPEC §4 order, plus Leelawadee UI (Thai, Lao, Khmer) before the symbol font.
+        // SPEC §4 order, plus Leelawadee UI (Thai, Lao, Khmer) before the symbol font, then
+        // the other scripts Windows 10/11 ship fonts for. Loading is lazy and driven by
+        // coverage, and files that don't exist are skipped.
         let list: &[(&str, &[&str])] = &[
             ("segoeui.ttf", &[]),
             ("msyh.ttc", &["Microsoft YaHei UI"]),
@@ -332,6 +346,14 @@ fn candidates() -> Vec<Candidate> {
             ("LeelawUI.ttf", &[]),
             ("seguisym.ttf", &[]),
             ("seguihis.ttf", &[]),
+            ("ebrima.ttf", &[]),   // Ethiopic, N'Ko, Vai, Tifinagh, Osmanya
+            ("gadugi.ttf", &[]),   // Cherokee, Unified Canadian Aboriginal Syllabics
+            ("mmrtext.ttf", &[]),  // Myanmar
+            ("himalaya.ttf", &[]), // Tibetan
+            ("monbaiti.ttf", &[]), // Mongolian
+            ("msyi.ttf", &[]),     // Yi
+            ("javatext.ttf", &[]), // Javanese
+            ("msjh.ttc", &["Microsoft JhengHei UI"]), // Han that YaHei lacks
         ];
         for (file, prefer) in list {
             out.push(Candidate {
@@ -552,6 +574,55 @@ mod tests {
         assert!(!bundled_covers('你'));
         assert!(!bundled_covers('ع'));
         assert!(bundled_covers('\u{FE0F}'));
+    }
+
+    /// The font file behind a bundled font key.
+    fn bundled_bytes(key: &str) -> &'static [u8] {
+        match key {
+            EMOJI_KEY => NOTO_EMOJI,
+            "jetbrains-mono" => JETBRAINS_MONO,
+            "literata-400" => LITERATA,
+            "literata-600" => LITERATA_SEMIBOLD,
+            "literata-italic-400" => LITERATA_ITALIC,
+            "literata-italic-600" => LITERATA_SEMIBOLD_ITALIC,
+            k if k.starts_with("inter-italic-") => INTER_ITALIC,
+            k if k.starts_with("inter-") => INTER,
+            k => panic!("unknown font key {k}"),
+        }
+    }
+
+    #[test]
+    fn every_family_reaches_every_bundled_glyph() {
+        use skrifa::MetadataProvider as _;
+        // Everything a bundled font maps counts as covered (no system fallback is loaded for
+        // it), so every family's chain must contain a font that has it.
+        let covered: BTreeSet<char> = bundled_charmaps()
+            .iter()
+            .flat_map(|f| {
+                f.charmap()
+                    .mappings()
+                    .filter_map(|(c, _)| char::from_u32(c))
+            })
+            .filter(|c| !('\u{E000}'..='\u{F8FF}').contains(c)) // private use
+            .collect();
+        for c in ['\u{FFFD}', '├', '─', '│', '└', '∀', '∈', '≡', '⊂'] {
+            assert!(
+                covered.contains(&c) && missing_chars([c]).is_empty(),
+                "{c:?}"
+            );
+        }
+        for (fam, list) in all_families() {
+            let fonts: Vec<skrifa::FontRef> = bundled_chain(&fam, list)
+                .iter()
+                .map(|k| skrifa::FontRef::new(bundled_bytes(k)).unwrap())
+                .collect();
+            let missing: Vec<String> = covered
+                .iter()
+                .filter(|&&c| !fonts.iter().any(|f| f.charmap().map(c).is_some()))
+                .map(|c| format!("U+{:04X}", *c as u32))
+                .collect();
+            assert!(missing.is_empty(), "{fam:?} can't draw {missing:?}");
+        }
     }
 
     #[test]

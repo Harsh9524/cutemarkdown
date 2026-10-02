@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use syntect::easy::ScopeRegionIterator;
-use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
+use syntect::parsing::{
+    ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder,
+};
 use syntect::util::LinesWithEndings;
 
 /// Palette role of a code token.
@@ -54,14 +56,37 @@ fn syntax_set() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
+/// Our own grammars, for languages two-face only ships for the Oniguruma regex engine.
+fn extra_syntax_set() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        let mut b = SyntaxSetBuilder::new();
+        for src in [include_str!("../assets/syntaxes/PowerShell.sublime-syntax")] {
+            match SyntaxDefinition::load_from_str(src, true, None) {
+                Ok(def) => b.add(def),
+                Err(e) => debug_assert!(false, "bundled grammar: {e}"),
+            }
+        }
+        b.build()
+    })
+}
+
 /// Is `lang` something we can highlight (without loading anything heavy)?
 pub fn is_diff(lang: &str) -> bool {
     matches!(lang.to_ascii_lowercase().as_str(), "diff" | "patch")
 }
 
-fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
+/// The grammar for a fence's language, with the set it belongs to.
+fn find_syntax(lang: &str) -> Option<(&'static SyntaxSet, &'static SyntaxReference)> {
     let ss = syntax_set();
     let l = lang.to_ascii_lowercase();
+    if matches!(
+        l.as_str(),
+        "ps1" | "psm1" | "psd1" | "powershell" | "pwsh" | "posh"
+    ) {
+        let extra = extra_syntax_set();
+        return extra.find_syntax_by_name("PowerShell").map(|s| (extra, s));
+    }
     let token = match l.as_str() {
         "ts" | "typescript" | "mts" | "cts" => "ts",
         "js" | "javascript" | "mjs" | "cjs" | "node" | "jsx" => "js",
@@ -77,15 +102,19 @@ fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
         "py3" | "python3" => "py",
         "math" | "latex" | "tex" | "katex" => "tex",
         "docker" | "containerfile" => "dockerfile",
-        "objc" | "objective-c" | "objectivec" => return ss.find_syntax_by_name("Objective-C"),
+        "objc" | "objective-c" | "objectivec" => {
+            return ss.find_syntax_by_name("Objective-C").map(|s| (ss, s));
+        }
         "text" | "txt" | "plain" | "plaintext" | "" => return None,
         other => other,
     };
-    ss.find_syntax_by_token(token).or_else(|| {
-        ss.syntaxes()
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(lang))
-    })
+    ss.find_syntax_by_token(token)
+        .or_else(|| {
+            ss.syntaxes()
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(lang))
+        })
+        .map(|s| (ss, s))
 }
 
 fn scopes(list: &[&str]) -> Vec<Scope> {
@@ -201,10 +230,9 @@ pub fn highlight_now(lang: &str, code: &str) -> Highlighted {
     if is_diff(lang) {
         return highlight_diff(code);
     }
-    let Some(syntax) = find_syntax(lang) else {
+    let Some((ss, syntax)) = find_syntax(lang) else {
         return Highlighted::default();
     };
-    let ss = syntax_set();
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
     let mut cache = HashMap::new();
@@ -460,5 +488,29 @@ mod tests {
         }
         assert!(!supported("mermaid"));
         assert!(!supported("text"));
+    }
+
+    #[test]
+    fn powershell() {
+        for l in ["ps1", "PowerShell", "pwsh", "psm1"] {
+            assert!(supported(l), "{l}");
+        }
+        let code = "# Get the logs\n<# block\n comment #>\nfunction Get-Logs {\n    param([string]$Path = \"$env:TEMP\\logs\")\n    \
+                    Get-ChildItem -Path $Path -Filter '*.log' | Where-Object { $_.Length -gt 1KB }\n    \
+                    if ($null -eq $x) { return 42 }\n}\n$s = @\"\nHello $name\n\"@\n";
+        let h = highlight_now("ps1", code);
+        assert_eq!(role_of(&h, code, "Get the"), Role::Comment);
+        assert_eq!(role_of(&h, code, "comment"), Role::Comment);
+        assert_eq!(role_of(&h, code, "function"), Role::Keyword);
+        assert_eq!(role_of(&h, code, "Get-ChildItem"), Role::Function);
+        assert_eq!(role_of(&h, code, "string"), Role::Type);
+        assert_eq!(role_of(&h, code, "TEMP"), Role::String);
+        assert_eq!(role_of(&h, code, "*.log"), Role::String);
+        assert_eq!(role_of(&h, code, "-gt"), Role::Operator);
+        assert_eq!(role_of(&h, code, "$null"), Role::Constant);
+        assert_eq!(role_of(&h, code, "if"), Role::Keyword);
+        assert_eq!(role_of(&h, code, "42"), Role::Number);
+        assert_eq!(role_of(&h, code, "Hello"), Role::String);
+        assert_eq!(role_of(&h, code, "-Filter"), Role::Plain);
     }
 }

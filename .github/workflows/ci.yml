@@ -43,7 +43,7 @@ jobs:
         run: cargo test --workspace --locked
 
   windows:
-    name: Windows (release build, installer, portable zip)
+    name: Windows (test, release build, installer, portable zip)
     runs-on: windows-latest
     defaults:
       run:
@@ -54,6 +54,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Windows-only code paths (file URIs, UNC rules, fonts) are only exercised here.
+      - name: Test
+        run: cargo test --workspace --locked
 
       # MSVC target, static CRT (.cargo/config.toml), icon/manifest embedded by build.rs.
       - name: Build release

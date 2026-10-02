@@ -23,12 +23,14 @@ mod icons;
 mod ir;
 mod layout;
 mod parse;
+mod paths;
 mod slug;
 mod view;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+pub use paths::{file_uri_to_path, is_remote_path};
 pub use style::{FontChoice, Palette, Style, SyntaxPalette, ThemeKind};
 
 /// A heading in document order, used for the outline sidebar.

@@ -6,10 +6,13 @@
 
 # MSVC (Windows CI / local Windows builds): link the C runtime statically, so the .exe does not
 # need vcruntime140.dll / the Visual C++ Redistributable.
+#
+# Both: reserve an 8 MB main-thread stack (Windows' default is 1 MB). The engine bounds its own
+# recursion (crates/engine/src/parse.rs MAX_BLOCK_DEPTH); this is headroom on top of that.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/STACK:8388608"]
 
 # GNU (cross-compiling from Linux with mingw-w64): link libgcc and winpthreads statically, so the
 # .exe does not need libgcc_s_seh-1.dll / libwinpthread-1.dll next to it.
 [target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-Wl,--stack,8388608"]

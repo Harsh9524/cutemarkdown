@@ -19,10 +19,23 @@ pub struct SearchText {
 }
 
 fn fold(c: char) -> char {
+    if c == 'ς' {
+        return 'σ'; // final sigma
+    }
     let mut l = c.to_lowercase();
     match (l.next(), l.next()) {
         (Some(a), None) => a,
         _ => c,
+    }
+}
+
+/// Newlines, tabs and no-break spaces match spaces, in the text and in the query alike (a
+/// query pre-filled from a selection keeps them).
+fn norm(c: char) -> char {
+    if c == '\n' || c == '\t' || c == '\u{A0}' {
+        ' '
+    } else {
+        c
     }
 }
 
@@ -35,12 +48,7 @@ impl SearchText {
             if c == MARKER {
                 continue;
             }
-            // Newlines and tabs match spaces in queries.
-            let c = if c == '\n' || c == '\t' || c == '\u{A0}' {
-                ' '
-            } else {
-                c
-            };
+            let c = norm(c);
             chars.push(c);
             folded.push(fold(c));
             map.push(i as u32);
@@ -51,10 +59,11 @@ impl SearchText {
 
 /// All non-overlapping matches of `query` in the given runs, in document order.
 pub fn find_all(texts: &[SearchText], query: &str, case_sensitive: bool) -> Vec<Match> {
+    let q = query.chars().filter(|&c| c != MARKER).map(norm);
     let q: Vec<char> = if case_sensitive {
-        query.chars().collect()
+        q.collect()
     } else {
-        query.chars().map(fold).collect()
+        q.map(fold).collect()
     };
     let mut out = Vec::new();
     if q.is_empty() {
@@ -108,6 +117,17 @@ mod tests {
         assert_eq!(count(src, "the code", false), 1);
         assert_eq!(count(src, "xyz", false), 0);
         assert_eq!(count(src, "", false), 0);
+    }
+
+    #[test]
+    fn queries_from_selections_match_what_is_shown() {
+        // A selection keeps NBSPs and tabs; they match the same text find shows.
+        let src = "Costs 100&nbsp;USD or 100 USD.\n\n```\nfn\tmain()\n```\n";
+        assert_eq!(count(src, "100\u{a0}USD", false), 2);
+        assert_eq!(count(src, "100 USD", true), 2);
+        assert_eq!(count(src, "fn\tmain", false), 1);
+        assert_eq!(count(src, "fn main", false), 1);
+        assert_eq!(count("Final ΟΔΟΣ and οδος.", "οδοσ", false), 2);
     }
 
     #[test]

@@ -1,0 +1,155 @@
+%YAML 1.2
+---
+# A compact PowerShell grammar for cutemarkdown's code blocks.
+#
+# two-face's PowerShell grammar needs the Oniguruma regex engine, and the engine uses the pure-Rust
+# fancy-regex backend, so this one only uses regex features fancy-regex supports. It covers what
+# shows up in documentation snippets: comments, strings with interpolation, variables, cmdlets,
+# parameters, operators, keywords, types and numbers. Scope names follow the usual Sublime
+# conventions so they map onto the engine's palette roles (highlight.rs).
+name: PowerShell
+file_extensions: [ps1, psm1, psd1]
+scope: source.powershell
+
+variables:
+  ident: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: variables
+    - include: types
+    - include: keywords
+    - include: operators
+    - include: cmdlets
+    - include: parameters
+    - include: numbers
+    - include: punctuation
+
+  comments:
+    - match: '<#'
+      scope: punctuation.definition.comment.begin.powershell
+      push:
+        - meta_scope: comment.block.powershell
+        - match: '#>'
+          scope: punctuation.definition.comment.end.powershell
+          pop: true
+    - match: '#'
+      scope: punctuation.definition.comment.powershell
+      push:
+        - meta_scope: comment.line.number-sign.powershell
+        - match: '$\n?'
+          pop: true
+
+  strings:
+    # Here-strings: @" … "@ and @' … '@, the closing quote at the start of a line.
+    - match: '@"(?=\s*$)'
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.double.heredoc.powershell
+        - match: '^"@'
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+        - include: interpolation
+    - match: "@'(?=\\s*$)"
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.single.heredoc.powershell
+        - match: "^'@"
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.double.powershell
+        - match: '""'
+          scope: constant.character.escape.powershell
+        - match: '"'
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+        - include: interpolation
+    - match: "'"
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.single.powershell
+        - match: "''"
+          scope: constant.character.escape.powershell
+        - match: "'"
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+
+  interpolation:
+    - match: '`.'
+      scope: constant.character.escape.powershell
+    - match: '\$\('
+      scope: punctuation.section.interpolation.begin.powershell
+      push:
+        - clear_scopes: 1
+        - meta_scope: meta.interpolation.powershell
+        - match: '\)'
+          scope: punctuation.section.interpolation.end.powershell
+          pop: true
+        - include: main
+    - include: variables
+
+  variables:
+    - match: '(?i)(\$)(true|false|null)\b'
+      scope: constant.language.powershell
+    - match: '(?i)(\$)(_|this|psitem|args|input|psscriptroot|pscmdlet|pshome|host|error|lastexitcode)\b'
+      scope: variable.language.powershell
+      captures:
+        1: punctuation.definition.variable.powershell
+    - match: '(\$)\{[^}]*\}'
+      scope: variable.other.readwrite.powershell
+      captures:
+        1: punctuation.definition.variable.powershell
+    - match: '(?i)([$@])((?:global|local|script|private|using|env|variable|function):)?({{ident}})'
+      captures:
+        1: punctuation.definition.variable.powershell
+        2: storage.modifier.scope.powershell
+        3: variable.other.readwrite.powershell
+    - match: '\$[$?^]'
+      scope: variable.language.powershell
+
+  types:
+    # [string], [System.IO.File], [CmdletBinding()], [Parameter(Mandatory)], [int[]]
+    - match: '(\[)([A-Za-z_][\w.]*(?:\[\])?)(?=[\](])'
+      captures:
+        1: punctuation.section.brackets.begin.powershell
+        2: entity.name.type.powershell
+
+  keywords:
+    - match: '(?i)\b(function|filter|workflow|class|enum|configuration)\b'
+      scope: storage.type.powershell
+    - match: '(?i)\b(if|elseif|else|switch|foreach|for|while|do|until|break|continue|return|exit|throw|trap|try|catch|finally|in|param|begin|process|end|dynamicparam|data|using|hidden|static)\b(?!-)'
+      scope: keyword.control.powershell
+
+  operators:
+    - match: '(?i)-(?:[ci])?(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|split|join|is|isnot|as)\b'
+      scope: keyword.operator.comparison.powershell
+    - match: '(?i)-(?:and|or|xor|not|band|bor|bxor|bnot|shl|shr|f)\b'
+      scope: keyword.operator.logical.powershell
+    - match: '\|\||&&|[|!]|[-+*/%]?=|\+\+|--'
+      scope: keyword.operator.powershell
+
+  cmdlets:
+    # Verb-Noun (Get-ChildItem, Set-StrictMode, Invoke-WebRequest).
+    - match: '(?i)\b[a-z]+-[a-z][a-z0-9]*\b'
+      scope: support.function.powershell
+
+  parameters:
+    - match: '(?<![\w$])-{{ident}}:?'
+      scope: variable.parameter.powershell
+
+  numbers:
+    - match: '\b0[xX][0-9a-fA-F]+[lL]?\b'
+      scope: constant.numeric.hex.powershell
+    - match: '(?i)\b\d+(?:\.\d+)?(?:e[+-]?\d+)?(?:[dl])?(?:kb|mb|gb|tb|pb)?\b'
+      scope: constant.numeric.powershell
+
+  punctuation:
+    - match: '[{}()\[\]]'
+      scope: punctuation.section.powershell
+    - match: '[;,]'
+      scope: punctuation.separator.powershell

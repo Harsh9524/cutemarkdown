@@ -32,6 +32,8 @@ pub mod flags {
     pub const UNDERLINE: u16 = 1 << 9;
     /// Footnote reference number.
     pub const FOOTREF: u16 = 1 << 10;
+    /// A footnote's "↩" back-link (and the space before it): left out of the hover card.
+    pub const FOOTBACK: u16 = 1 << 11;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

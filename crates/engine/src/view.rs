@@ -172,6 +172,9 @@ pub(crate) struct ViewState {
     scroll_y: f32,
     pending: Option<ScrollReq>,
     anim: Option<Anim>,
+    /// An anchor jump in progress: its target is recomputed as blocks above it are laid out
+    /// (their heights start as estimates), until layout is complete or the reader scrolls.
+    anchor_target: Option<String>,
     /// Keep the view pinned to the end (End key, scroll_to_bottom, follow-tail) until the
     /// reader scrolls away; survives heights changing during progressive layout.
     stick_bottom: bool,
@@ -206,6 +209,8 @@ pub(crate) struct ViewState {
     card_cache: Option<(String, LayoutKey, Arc<LBlock>)>,
     /// What the context menu was opened on.
     menu_target: MenuTarget,
+    /// The document changed under an open context menu: close it (its target is gone).
+    menu_stale: bool,
     /// Measured cost of the last `show` (for benchmarks).
     pub last_show_secs: f64,
     pub layout_complete: bool,
@@ -227,6 +232,7 @@ impl ViewState {
             scroll_y: 0.0,
             pending: None,
             anim: None,
+            anchor_target: None,
             stick_bottom: false,
             reduce_motion: false,
             layout_gen: 0,
@@ -254,6 +260,7 @@ impl ViewState {
             card_request: None,
             card_cache: None,
             menu_target: MenuTarget::default(),
+            menu_stale: false,
             last_show_secs: 0.0,
             layout_complete: false,
         };
@@ -481,6 +488,7 @@ impl ViewState {
 
     pub fn request(&mut self, r: ScrollReqPub) {
         self.anim = None;
+        self.anchor_target = None;
         self.pending = Some(match r {
             ScrollReqPub::Y(y) => ScrollReq::Y(y),
             ScrollReqPub::Bottom => ScrollReq::Bottom,
@@ -499,11 +507,15 @@ impl ViewState {
     pub fn set_document(&mut self, old: &Document, new: &Document, keep_position: bool) {
         let at_end = self.scroll_y >= self.max_scroll() - 48.0 && self.max_scroll() > 0.0;
         let anchor = self.anchor();
+        self.anchor_target = None;
         let old_slots = std::mem::take(&mut self.slots);
         self.reset_slots(new, Some((old, &old_slots)));
         self.uri_blocks.clear();
         self.sel = None;
         self.sel_dragging = false;
+        // A heading/link/image the open context menu points at may not exist any more.
+        self.menu_target = MenuTarget::default();
+        self.menu_stale = true;
         self.fallbacks_requested = false;
         if !keep_position {
             self.scroll_y = 0.0;
@@ -520,8 +532,16 @@ impl ViewState {
         if at_end {
             self.pending = Some(ScrollReq::Bottom);
         } else if let Some((i, off, _)) = anchor {
-            let target = map_block(old, new, i);
-            self.pending = Some(ScrollReq::Block(target.0, if target.1 { off } else { 0.0 }));
+            // The same block, or the block that took its place (a list or table being edited):
+            // keep the offset within it (clamped to its new height when resolved). Otherwise
+            // start at the top of the nearest block we could find.
+            let (j, how) = map_block(old, new, i);
+            let off = if how == BlockMatch::Fallback {
+                0.0
+            } else {
+                off
+            };
+            self.pending = Some(ScrollReq::Block(j, off));
         }
         // Re-run find, keeping the match closest to the previous one.
         if !self.find.query.is_empty() {
@@ -837,8 +857,12 @@ impl ViewState {
         let want: Vec<usize> = (a..b).collect();
         self.ensure_layout(doc, &ctx, style, &want, 0.0, true);
 
-        // 2. Input → scroll.
+        // 2. Input → scroll. Scrolling by hand ends an anchor jump's retargeting.
+        let before = (self.scroll_y, self.anim.map(|a| a.to));
         self.handle_input(doc, ui, &resp, style, rect, now);
+        if (self.scroll_y, self.anim.map(|a| a.to)) != before {
+            self.anchor_target = None;
+        }
 
         // 3. Resolve programmatic scroll requests (may need specific blocks laid out).
         self.resolve_pending(doc, &ctx, style);
@@ -855,6 +879,7 @@ impl ViewState {
             self.ensure_layout(doc, &ctx, style, &near, 0.006, false);
             ctx.request_repaint();
         }
+        self.retarget_anchor(doc);
         if self.stick_bottom {
             let max = self.max_scroll();
             match &mut self.anim {
@@ -867,7 +892,7 @@ impl ViewState {
         // 5. Paint and interact.
         let content_origin_y = rect.top() + self.top_pad() - self.scroll_y;
         let (a, b) = self.visible_range(0.0);
-        let hits = self.collect_hits(doc, rect, col_left, content_origin_y, a, b);
+        let hits = self.collect_hits(&ctx, rect, col_left, content_origin_y, a, b);
         self.handle_pointer(doc, ui, &resp, rect, &hits, &mut out, now);
         self.context_menu(doc, ui, &resp, rect, &hits, &mut out);
         let actions = self.paint(
@@ -1221,8 +1246,41 @@ impl ViewState {
         let target = (y + 16.0).clamp(0.0, self.max_scroll());
         let now = ctx.input(|i| i.time);
         self.animate_to(target, now, 0.22);
+        self.anchor_target = Some(name.to_owned());
         if flash && name.starts_with("fn-") {
             self.flash = Some((name.to_owned(), now));
+        }
+    }
+
+    /// Where an anchor's jump target is now: the blocks above it may have been laid out (real
+    /// heights replacing estimates) since the jump started.
+    fn anchor_y(&self, doc: &Document, name: &str) -> Option<f32> {
+        let i = *doc.p.anchors.get(name)? as usize;
+        let slot = self.slots.get(i)?;
+        let off = slot
+            .lb
+            .as_ref()
+            .and_then(|lb| lb.anchors.iter().find(|(n, _, _)| n == name))
+            .map_or(0.0, |(_, y, _)| *y);
+        Some((self.tops[i] + off + 16.0).clamp(0.0, self.max_scroll()))
+    }
+
+    /// Keep an anchor jump pointed at its heading while layout progresses (SPEC §7: a link's
+    /// `#anchor` lands like any in-document jump, also right after opening a document).
+    fn retarget_anchor(&mut self, doc: &Document) {
+        let Some(name) = self.anchor_target.clone() else {
+            return;
+        };
+        let Some(target) = self.anchor_y(doc, &name) else {
+            self.anchor_target = None;
+            return;
+        };
+        match &mut self.anim {
+            Some(a) => a.to = target,
+            None => self.scroll_y = target,
+        }
+        if self.layout_complete && self.anim.is_none() {
+            self.anchor_target = None;
         }
     }
 
@@ -1252,23 +1310,23 @@ impl ViewState {
         for it in &lb.items {
             match it {
                 Item::Text(t) if t.run == mt.run => {
-                    let starts = layout::row_starts(&t.galley);
-                    let r = layout::char_rect(&t.galley, &starts, mt.start as usize);
+                    let r = layout::char_rect(&t.galley, &t.starts, mt.start as usize);
                     found = Some((t.pos.y + r.top(), None));
                 }
                 Item::Scroll(s) => {
-                    for inner in &s.items {
-                        // Code split per line (wrap mode): the last piece starting at/before it.
-                        if let Item::Text(t) = inner
-                            && t.run == mt.run
-                            && t.char_base <= mt.start as usize
-                        {
-                            let starts = layout::row_starts(&t.galley);
-                            let local = mt.start as usize - t.char_base;
-                            let r = layout::char_rect(&t.galley, &starts, local);
-                            let x = t.pos.x + r.left();
-                            found = Some((t.pos.y + r.top(), Some((s.id, x, s.frame.width()))));
+                    // Code split per line (wrap mode) or into chunks (huge blocks): the last
+                    // piece starting at/before the match.
+                    let piece = s.items.iter().rev().find_map(|inner| match inner {
+                        Item::Text(t) if t.run == mt.run && t.char_base <= mt.start as usize => {
+                            Some(t)
                         }
+                        _ => None,
+                    });
+                    if let Some(t) = piece {
+                        let local = mt.start as usize - t.char_base;
+                        let r = layout::char_rect(&t.shaped(ctx), &t.starts, local);
+                        let x = t.pos.x + r.left();
+                        found = Some((t.pos.y + r.top(), Some((s.id, x, s.frame.width()))));
                     }
                 }
                 _ => {}
@@ -1318,9 +1376,10 @@ impl ViewState {
             0.0
         };
         out.scrollable = max > 0.0;
-        // Scrollspy.
+        // Scrollspy: the last heading whose top is at or above 30% of the viewport, measured
+        // from the window's top edge (SPEC §3), whether or not the app bar covers it.
         let vis_top = self.scroll_y - self.top_pad() + self.top_inset;
-        let reference = vis_top + 0.3 * (self.viewport_h - self.top_inset);
+        let reference = self.scroll_y - self.top_pad() + 0.3 * self.viewport_h;
         let at_bottom = max > 0.0 && self.scroll_y >= max - 1.0;
         let vis_bottom = self.scroll_y - self.top_pad() + self.viewport_h;
         let mut active = None;
@@ -1385,7 +1444,7 @@ impl ViewState {
                     .take(t.char_base)
                     .filter(|&c| c == '\n')
                     .count();
-                let rows = if off > r.top() && t.char_base == 0 {
+                let rows = if off > r.top() && (t.char_base == 0 || t.lazy.is_some()) {
                     ((off - r.top()) / t.line_h.max(1.0)) as usize
                 } else {
                     0
@@ -1413,7 +1472,7 @@ impl ViewState {
 
     fn collect_hits(
         &self,
-        _doc: &Document,
+        ctx: &egui::Context,
         rect: Rect,
         col_left: f32,
         oy: f32,
@@ -1451,12 +1510,16 @@ impl ViewState {
                         for (j, inner) in s.items.iter().enumerate() {
                             if let Item::Text(t) = inner {
                                 let o = t.pos + inner_origin;
+                                let r = t.rect().translate(inner_origin);
+                                if t.lazy.is_some() && !r.intersects(rect) {
+                                    continue; // an off-screen chunk of a huge code block
+                                }
                                 hits.push(Hit {
                                     run: t.run,
                                     origin: o,
-                                    rect: t.galley.rect.translate(o.to_vec2()).intersect(frame),
+                                    rect: r.intersect(frame),
                                     clip: frame.intersect(rect),
-                                    galley: t.galley.clone(),
+                                    galley: t.shaped(ctx),
                                     base: t.char_base,
                                     block: i,
                                     item: ItemPath {
@@ -1702,7 +1765,7 @@ impl ViewState {
             }
             let clamped = pos2(
                 p.x.clamp(rect.left(), rect.right()),
-                p.y.clamp(top_edge, rect.bottom() - 1.0),
+                p.y.clamp(top_edge, (rect.bottom() - 1.0).max(top_edge)),
             );
             if let Some(pos) = self.hit_pos(hits, clamped)
                 && let Some(sel) = &mut self.sel
@@ -2043,7 +2106,7 @@ impl ViewState {
         hover_link: Option<&str>,
     ) {
         let pal = &style.palette;
-        let g = &t.galley;
+        let g = &t.shaped(ui.ctx());
         let gpos = t.pos + origin;
         let gv = gpos.to_vec2();
         // Background decorations.
@@ -2061,14 +2124,11 @@ impl ViewState {
                     let inner = Rect::from_min_max(r.min + vec2(1.0, 1.0), r.max - vec2(1.0, 2.0));
                     painter.rect_filled(inner, 3.0, pal.surface);
                 }
-                DecoKind::Line(_) => {}
+                DecoKind::Line(_) | DecoKind::Dot { .. } => {}
             }
         }
-        let n_chars = g
-            .rows
-            .iter()
-            .map(|r| r.char_count_including_newline().0)
-            .sum::<usize>();
+        let starts = &t.starts[..];
+        let n_chars = starts.last().copied().unwrap_or(0);
         // Run char ranges → this galley's chars (code may be split into one galley per line).
         let base = t.char_base;
         let local = |s: usize, e: usize| {
@@ -2083,8 +2143,32 @@ impl ViewState {
             .and_then(|r| local(r.start, r.end));
         let lo = matches.partition_point(|m| m.run < t.run);
         let hi = matches.partition_point(|m| m.run <= t.run);
-        if sel.is_some() || lo < hi {
-            let starts = layout::row_starts(g);
+        // Paint the selection and find matches only on the galley's visible rows: a big code
+        // block or paragraph can hold thousands of matches (SPEC principle 6).
+        let (vis_lo, vis_hi, sel) = if sel.is_some() || lo < hi {
+            let clip = painter.clip_rect();
+            let row0 = g
+                .rows
+                .partition_point(|r| gpos.y + r.pos.y + r.size.y < clip.top());
+            let row1 = g
+                .rows
+                .partition_point(|r| gpos.y + r.pos.y <= clip.bottom());
+            // Visible chars, galley-local (the newline ending the last visible row included).
+            let c0 = starts.get(row0).copied().unwrap_or(n_chars);
+            let c1 = starts.get(row1).copied().unwrap_or(n_chars);
+            let run_matches = &matches[lo..hi];
+            let sel = sel
+                .map(|r| r.start.max(c0)..r.end.min(c1))
+                .filter(|r| !r.is_empty());
+            (
+                lo + run_matches.partition_point(|m| (m.end as usize) <= base + c0),
+                lo + run_matches.partition_point(|m| (m.start as usize) < base + c1),
+                sel,
+            )
+        } else {
+            (lo, lo, None)
+        };
+        if sel.is_some() || vis_lo < vis_hi {
             let line_box = |ri: usize| {
                 let row = &g.rows[ri];
                 let bl = row.pos.y + t.asc + (row.size.y - t.line_h) + t.shift;
@@ -2092,7 +2176,7 @@ impl ViewState {
                 (top, top + t.line_h)
             };
             if let Some(range) = sel {
-                for (ri, x0, x1) in layout::segments(g, &starts, range) {
+                for (ri, x0, x1) in layout::segments(g, starts, range) {
                     let (top, bottom) = line_box(ri);
                     painter.rect_filled(
                         Rect::from_min_max(pos2(x0, top), pos2(x1, bottom)).translate(gv),
@@ -2101,12 +2185,12 @@ impl ViewState {
                     );
                 }
             }
-            for (mi, m) in matches[lo..hi].iter().enumerate() {
-                let current = self.find.current == Some(lo + mi);
+            for (mi, m) in matches[vis_lo..vis_hi.max(vis_lo)].iter().enumerate() {
+                let current = self.find.current == Some(vis_lo + mi);
                 let Some(range) = local(m.start as usize, m.end as usize) else {
                     continue;
                 };
-                for (ri, x0, x1) in layout::segments(g, &starts, range) {
+                for (ri, x0, x1) in layout::segments(g, starts, range) {
                     let (top, bottom) = line_box(ri);
                     let r =
                         Rect::from_min_max(pos2(x0 - 1.0, top + 2.0), pos2(x1 + 1.0, bottom - 2.0))
@@ -2138,9 +2222,8 @@ impl ViewState {
             && cur < hi
         {
             let m = matches[cur];
-            let starts = layout::row_starts(g);
             let range = local(m.start as usize, m.end as usize).unwrap_or(0..0);
-            for (ri, x0, x1) in layout::segments(g, &starts, range) {
+            for (ri, x0, x1) in layout::segments(g, starts, range) {
                 let row = &g.rows[ri];
                 let r = Rect::from_min_max(pos2(x0, row.pos.y), pos2(x1, row.pos.y + row.size.y))
                     .translate(gv);
@@ -2151,10 +2234,26 @@ impl ViewState {
                 );
             }
         }
-        // Lines.
+        // Lines and status shapes.
         for d in &t.decos {
-            if let DecoKind::Line(c) = d.kind {
-                painter.rect_filled(d.rect.translate(gv), 0.0, c);
+            let r = d.rect.translate(gv);
+            match d.kind {
+                DecoKind::Line(c) => {
+                    painter.rect_filled(r, 0.0, c);
+                }
+                DecoKind::Dot {
+                    color,
+                    square,
+                    ring,
+                } => {
+                    let stroke = ring.map_or(Stroke::NONE, |c| Stroke::new(1.0, c));
+                    if square {
+                        painter.rect(r, 2.0, color, stroke, StrokeKind::Inside);
+                    } else {
+                        painter.circle(r.center(), r.width() / 2.0, color, stroke);
+                    }
+                }
+                _ => {}
             }
         }
         let rt_links = &doc.p.texts[t.run as usize].links;
@@ -2290,8 +2389,12 @@ impl ViewState {
             pos2(zone.left(), zone.top() + 4.0),
             pos2(zone.right(), zone.bottom() - 4.0),
         );
+        if track.height() < 8.0 {
+            return; // a window too short for a scrollbar
+        }
         let total = self.top_pad() + self.doc_height() + 0.4 * self.viewport_h;
-        let thumb_h = (track.height() * self.viewport_h / total).clamp(32.0, track.height());
+        let thumb_h = (track.height() * self.viewport_h / total)
+            .clamp(32.0_f32.min(track.height()), track.height());
         let thumb_y = track.top() + (track.height() - thumb_h) * (self.scroll_y / max);
         let hovered = resp.hovered() || resp.dragged();
         if hovered {
@@ -2477,7 +2580,9 @@ impl ViewState {
                 if let ObjKind::Image { uri } = &o.kind
                     && o.rect.translate(h.origin.to_vec2()).contains(p)
                 {
-                    return Some((uri.clone(), uri.trim_start_matches("file://").to_owned()));
+                    let src = crate::paths::file_uri_to_path(uri)
+                        .map_or_else(|| uri.clone(), |p| p.display().to_string());
+                    return Some((uri.clone(), src));
                 }
             }
         }
@@ -2510,11 +2615,17 @@ impl ViewState {
                 link,
                 image: self.image_at(rect, hits, p),
             };
+            self.menu_stale = false;
         }
         let target = self.menu_target.clone();
         let has_sel = self.has_selection();
+        let stale = self.menu_stale;
         let mut actions: Vec<MenuAction> = Vec::new();
         resp.context_menu(|ui| {
+            if stale {
+                ui.close();
+                return;
+            }
             ui.set_min_width(200.0);
             if ui.add_enabled(has_sel, egui::Button::new("Copy")).clicked() {
                 actions.push(MenuAction::Copy(self.selected_text(doc)));
@@ -2542,18 +2653,17 @@ impl ViewState {
                     ui.close();
                 }
                 if ui.button("Open image").clicked() {
-                    let t = match uri.strip_prefix("file://") {
-                        Some(path) => LinkTarget::File {
-                            path: path.into(),
-                            anchor: None,
-                        },
+                    let t = match crate::paths::file_uri_to_path(uri) {
+                        Some(path) => LinkTarget::File { path, anchor: None },
                         None => LinkTarget::External(uri.clone()),
                     };
                     actions.push(MenuAction::Open(t));
                     ui.close();
                 }
             }
-            if let Some(h) = target.heading {
+            if let Some(h) = target.heading
+                && let (Some(head), Some(meta)) = (doc.p.headings.get(h), doc.p.heading_meta.get(h))
+            {
                 ui.separator();
                 if ui.button("Copy section as Markdown").clicked() {
                     actions.push(MenuAction::Copy(
@@ -2562,11 +2672,11 @@ impl ViewState {
                     ui.close();
                 }
                 if ui.button("Copy link to section").clicked() {
-                    actions.push(MenuAction::Copy(format!("#{}", doc.p.headings[h].anchor)));
+                    actions.push(MenuAction::Copy(format!("#{}", head.anchor)));
                     ui.close();
                 }
                 if ui.button("Open in editor here").clicked() {
-                    actions.push(MenuAction::Editor(doc.p.heading_meta[h].line as usize));
+                    actions.push(MenuAction::Editor(meta.line as usize));
                     ui.close();
                 }
             }
@@ -2642,7 +2752,10 @@ impl ViewState {
             .fold(0.0, f32::max);
         let w = (content_w + 2.0 * pad_x).clamp(80.0, card_w);
         let h = lb.height + 2.0 * pad_y;
-        let mut x = (p.x - 24.0).clamp(rect.left() + 8.0, rect.right() - w - 8.0);
+        let mut x = (p.x - 24.0).clamp(
+            rect.left() + 8.0,
+            (rect.right() - w - 8.0).max(rect.left() + 8.0),
+        );
         let mut y = p.y + 18.0;
         if y + h > rect.bottom() - 8.0 {
             y = p.y - 14.0 - h;
@@ -2916,41 +3029,56 @@ fn collect_runs(b: &Block, out: &mut Vec<RunId>) {
 /// Map a top-level block of the old document to the new one (SPEC §7 anchor fallbacks):
 /// same key → same content anywhere in the same section → same ordinal in the section →
 /// the section's heading → proportional position. Returns (index, exact).
-fn map_block(old: &Document, new: &Document, i: usize) -> (usize, bool) {
+/// How [`map_block`] found the new block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockMatch {
+    /// The same content.
+    Exact,
+    /// Changed content in the same structural slot (path + ordinal): an edited list or table.
+    SameSlot,
+    /// A nearby block (the preceding heading, or the same fraction of the document).
+    Fallback,
+}
+
+/// Where old top-level block `i` is in the new document (SPEC §7 live reload anchor).
+fn map_block(old: &Document, new: &Document, i: usize) -> (usize, BlockMatch) {
     let n = new.p.blocks.len();
     if n == 0 {
-        return (0, false);
+        return (0, BlockMatch::Fallback);
     }
     let Some(k) = old.p.top_keys.get(i) else {
-        return (0, false);
+        return (0, BlockMatch::Fallback);
     };
     let keys = &new.p.top_keys;
     if let Some(j) = keys.iter().position(|nk| nk == k) {
-        return (j, true);
+        return (j, BlockMatch::Exact);
     }
     if let Some(j) = keys
         .iter()
         .position(|nk| nk.path == k.path && nk.content == k.content)
     {
-        return (j, true);
+        return (j, BlockMatch::Exact);
     }
     if let Some(j) = keys.iter().position(|nk| nk.content == k.content) {
-        return (j, true);
+        return (j, BlockMatch::Exact);
     }
     if let Some(j) = keys
         .iter()
         .position(|nk| nk.path == k.path && nk.ordinal == k.ordinal)
     {
-        return (j, false);
+        return (j, BlockMatch::SameSlot);
     }
     // Nearest preceding heading.
     for oi in (0..i).rev() {
         if matches!(old.p.blocks[oi].kind, BlockKind::Heading { .. })
             && let Some(j) = keys.iter().position(|nk| *nk == old.p.top_keys[oi])
         {
-            return (j, false);
+            return (j, BlockMatch::Fallback);
         }
     }
     let frac = i as f32 / old.p.blocks.len().max(1) as f32;
-    (((frac * n as f32) as usize).min(n - 1), false)
+    (
+        ((frac * n as f32) as usize).min(n - 1),
+        BlockMatch::Fallback,
+    )
 }

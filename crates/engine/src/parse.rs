@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use comrak::arena_tree::NodeEdge;
 use comrak::nodes::{AlertType, AstNode, ListType, NodeValue, TableAlignment};
 use comrak::{Arena, Options, parse_document};
 
 use crate::Heading;
 use crate::html::{self, Token};
 use crate::ir::*;
+use crate::paths;
 use crate::slug::Slugger;
 
 /// Everything the parser produces.
@@ -51,6 +53,13 @@ pub struct BlockKey {
     pub content: u64,
 }
 
+/// Containers (quotes, lists, alerts, footnotes, `<details>`) nested deeper than this are
+/// flattened into one plain paragraph. That bounds the recursion in parsing, layout and paint
+/// (no stack overflow on Windows' 1 MB main-thread stack), and the text stays readable.
+const MAX_BLOCK_DEPTH: u16 = 32;
+/// Inline formatting (emphasis, links, …) nested deeper than this keeps its text, unformatted.
+const MAX_INLINE_DEPTH: u16 = 32;
+
 const CODE_PAD_EM: f32 = 5.0 / 16.0;
 const KBD_PAD_EM: f32 = 7.0 / 16.0;
 
@@ -82,6 +91,8 @@ pub fn parse(source: &str, base_dir: Option<&Path>) -> Parsed {
         footrefs: Vec::new(),
         pending_marker: None,
         list_depth: 0,
+        depth: 0,
+        inline_depth: 0,
         table_ord: 0,
         cell: None,
         cur_line: 1,
@@ -354,16 +365,114 @@ fn split_front_matter(src: &str) -> Option<FrontMatterSplit> {
         };
         offset += line.len();
         if closes {
-            return Some(FrontMatterSplit {
-                inner: inner.trim_end_matches('\n').to_owned(),
+            let inner = inner.trim_end_matches('\n').to_owned();
+            // Only real metadata: a document may just as well open with a thematic break and
+            // have another one further down (SPEC §1.5: never hide content).
+            let meta = if toml {
+                looks_like_toml(&inner)
+            } else {
+                looks_like_yaml(&inner)
+            };
+            return meta.then_some(FrontMatterSplit {
+                inner,
                 toml,
                 lines: n,
                 bytes: offset,
             });
         }
+        if k == 0 && line.trim().is_empty() {
+            // `---` then a blank line is a rule, not front matter (as in Pandoc).
+            return None;
+        }
         inner.push_str(line);
     }
     None
+}
+
+/// YAML metadata: top-level `key: value` lines (at least one), list items, indented
+/// continuations and comments only.
+fn looks_like_yaml(inner: &str) -> bool {
+    let mut keys = 0;
+    for line in inner.lines() {
+        let t = line.trim_end();
+        if t.is_empty() || t.trim_start().starts_with('#') || t.starts_with([' ', '\t']) {
+            continue;
+        }
+        if t == "-" || t.starts_with("- ") {
+            continue;
+        }
+        // `key:` then a space or the end of the line; the key is a single word or quoted.
+        let key_line = t.split_once(':').is_some_and(|(key, rest)| {
+            let quoted = key.len() >= 2 && key.starts_with(['"', '\'']);
+            let word = !key.is_empty()
+                && !key.contains(char::is_whitespace)
+                && key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '$' | '@'));
+            (quoted || word) && (rest.is_empty() || rest.starts_with([' ', '\t']))
+        });
+        if !key_line {
+            return false;
+        }
+        keys += 1;
+    }
+    keys > 0
+}
+
+/// TOML metadata: `key = value` lines (at least one), `[table]` headers, comments, and the
+/// continuation lines of multi-line arrays and strings.
+fn looks_like_toml(inner: &str) -> bool {
+    let mut keys = 0;
+    let mut open_brackets = 0i32;
+    let mut in_string: Option<&str> = None;
+    let brackets = |s: &str| {
+        s.chars().filter(|&c| c == '[').count() as i32
+            - s.chars().filter(|&c| c == ']').count() as i32
+    };
+    for line in inner.lines() {
+        let t = line.trim();
+        if let Some(q) = in_string {
+            if t.contains(q) {
+                in_string = None;
+            }
+            continue;
+        }
+        if open_brackets > 0 {
+            open_brackets += brackets(t);
+            continue;
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') && t.ends_with(']') {
+            continue;
+        }
+        let Some((key, value)) = t.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let bare = |k: &str| {
+            !k.is_empty()
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
+        };
+        let quoted = key.len() >= 2 && (key.starts_with('"') || key.starts_with('\''));
+        if !(bare(key) || quoted) {
+            return false;
+        }
+        keys += 1;
+        let value = value.trim();
+        for q in ["\"\"\"", "\'\'\'"] {
+            if value.matches(q).count() % 2 == 1 {
+                in_string = Some(q);
+            }
+        }
+        if in_string.is_none() {
+            open_brackets = brackets(value).max(0);
+        }
+    }
+    keys > 0
 }
 
 fn unquote(v: &str) -> String {
@@ -527,6 +636,9 @@ struct P<'s> {
     footrefs: Vec<(String, RunId)>,
     pending_marker: Option<String>,
     list_depth: u8,
+    /// Container nesting (see [`MAX_BLOCK_DEPTH`]) and inline nesting.
+    depth: u16,
+    inline_depth: u16,
     table_ord: u32,
     cell: Option<(u32, u32, u32)>,
     /// Source line of the block being converted (for RunInfo::line).
@@ -550,8 +662,13 @@ struct Frame {
 }
 
 enum FrameKind {
-    Details { open: bool, summary: Option<RunId> },
+    Details {
+        open: bool,
+        summary: Option<RunId>,
+    },
     Center,
+    /// An element opened beyond [`MAX_BLOCK_DEPTH`]: its blocks go to the parent.
+    Flat,
 }
 
 impl Sink {
@@ -564,7 +681,13 @@ impl Sink {
         }
     }
 
-    fn open(&mut self, tag: &str, kind: FrameKind, line: u32) {
+    fn open(&mut self, p: &mut P, tag: &str, kind: FrameKind, line: u32) {
+        let kind = if p.depth >= MAX_BLOCK_DEPTH {
+            FrameKind::Flat
+        } else {
+            p.depth += 1;
+            kind
+        };
         self.stack.push(Frame {
             tag: tag.to_owned(),
             kind,
@@ -603,7 +726,15 @@ impl Sink {
 
     fn emit(&mut self, f: Frame, p: &mut P, end_line: u32) {
         let end_line = end_line.max(f.end_line);
+        if matches!(f.kind, FrameKind::Flat) {
+            for b in f.blocks {
+                self.push(b);
+            }
+            return;
+        }
+        p.depth = p.depth.saturating_sub(1);
         let kind = match f.kind {
+            FrameKind::Flat => unreachable!(),
             FrameKind::Details { open, summary } => {
                 let summary = summary.unwrap_or_else(|| p.new_run_plain("Details", RunKind::Text));
                 BlockKind::Details {
@@ -798,19 +929,18 @@ impl P<'_> {
         if let Some(frag) = url.strip_prefix('#') {
             return LinkDest::Anchor(percent_decode(frag));
         }
+        // A link that would reach another machine (`file://host/…`, a UNC path) is handed to
+        // the shell as an external URL, which blocks it without touching the file system.
+        let blocked = || LinkDest::External(url.to_owned());
         if has_scheme(url) {
-            if let Some(rest) = url.strip_prefix("file://") {
-                let (path, anchor) = split_anchor(rest);
-                let path = percent_decode(path);
-                // file:///C:/x → C:/x on Windows.
-                let path = if cfg!(windows) {
-                    path.trim_start_matches('/').to_owned()
-                } else {
-                    path
-                };
-                return LinkDest::File {
-                    path: PathBuf::from(path),
-                    anchor,
+            if url
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("file:"))
+            {
+                let (uri, anchor) = split_anchor(url);
+                return match paths::file_uri_local_path(uri).and_then(|p| self.resolve_local(&p)) {
+                    Some(path) => LinkDest::File { path, anchor },
+                    None => blocked(),
                 };
             }
             return LinkDest::External(url.to_owned());
@@ -820,14 +950,24 @@ impl P<'_> {
         if path.is_empty() {
             return LinkDest::Anchor(anchor.unwrap_or_default());
         }
-        let resolved = match &self.base_dir {
-            Some(b) => b.join(&path),
-            None => PathBuf::from(&path),
-        };
-        LinkDest::File {
-            path: resolved,
-            anchor,
+        match self.resolve_local(&path) {
+            Some(path) => LinkDest::File { path, anchor },
+            None => blocked(),
         }
+    }
+
+    /// Resolve a document-supplied local path against the document's folder. `None` when reading
+    /// it would make the OS contact another machine (SPEC §1.7): a UNC or device path, unless it
+    /// is on the share the document itself was opened from.
+    fn resolve_local(&self, path: &str) -> Option<PathBuf> {
+        let base = self.base_dir.as_deref();
+        let full = match base {
+            Some(b) => b.join(path),
+            None => PathBuf::from(path),
+        };
+        let remote = paths::is_remote_path(&full, base)
+            || (paths::looks_like_unc(path) && !paths::on_share_of(&full, base));
+        (!remote).then_some(full)
     }
 
     fn image_uri(&self, src: &str) -> Option<String> {
@@ -836,21 +976,23 @@ impl P<'_> {
             return None;
         }
         let lower = src.to_ascii_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("file://")
-        {
+        if lower.starts_with("http://") || lower.starts_with("https://") {
             return Some(src.to_owned());
         }
-        if has_scheme(src) {
+        let path = if lower.starts_with("file:") {
+            paths::file_uri_local_path(src.split(['?', '#']).next().unwrap_or(src))?
+        } else if has_scheme(src) {
+            return None;
+        } else {
+            percent_decode(src.split(['?', '#']).next().unwrap_or(src))
+        };
+        let full = self.resolve_local(&path)?;
+        // Pasted text has no folder: a relative path would be read relative to the working
+        // directory (and on Windows egui would take its first segment for a host name).
+        if full.is_relative() {
             return None;
         }
-        let path = percent_decode(src.split(['?', '#']).next().unwrap_or(src));
-        let full = match &self.base_dir {
-            Some(b) => b.join(&path),
-            None => PathBuf::from(&path),
-        };
-        Some(format!("file://{}", full.display()))
+        Some(paths::local_file_uri(&full))
     }
 
     fn make_link(&self, url: &str, bare: bool) -> Option<Link> {
@@ -872,9 +1014,15 @@ impl P<'_> {
     // ---- inlines -------------------------------------------------------------------------
 
     fn inlines<'a>(&mut self, node: &'a AstNode<'a>, b: &mut Inl) {
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            b.text(&plain_text(node));
+            return;
+        }
+        self.inline_depth += 1;
         for child in node.children() {
             self.inline(child, b);
         }
+        self.inline_depth -= 1;
     }
 
     fn with_flag<'a>(&mut self, node: &'a AstNode<'a>, b: &mut Inl, flag: u16) {
@@ -1100,11 +1248,60 @@ impl P<'_> {
     // ---- blocks --------------------------------------------------------------------------
 
     fn blocks<'a>(&mut self, parent: &'a AstNode<'a>) -> Vec<Block> {
+        if self.depth >= MAX_BLOCK_DEPTH {
+            return self.flat_blocks(parent);
+        }
+        self.depth += 1;
         let mut sink = Sink::default();
         for child in parent.children() {
             self.block(child, &mut sink);
         }
-        sink.finish(self)
+        let blocks = sink.finish(self);
+        self.depth -= 1;
+        blocks
+    }
+
+    /// A container's content beyond [`MAX_BLOCK_DEPTH`]: its text as one paragraph, one line
+    /// per block, gathered without recursion.
+    fn flat_blocks<'a>(&mut self, parent: &'a AstNode<'a>) -> Vec<Block> {
+        let mut text = String::new();
+        for edge in parent.traverse() {
+            match edge {
+                NodeEdge::Start(n) => match &n.data().value {
+                    NodeValue::Text(t) => text.push_str(t),
+                    NodeValue::Code(c) => text.push_str(&c.literal),
+                    NodeValue::CodeBlock(c) => text.push_str(&c.literal),
+                    NodeValue::SoftBreak => text.push(' '),
+                    NodeValue::LineBreak => text.push('\n'),
+                    NodeValue::HtmlBlock(h) => html_text(&h.literal, &mut text),
+                    _ => {}
+                },
+                NodeEdge::End(n) => {
+                    if n.data().value.block() && !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let sp = parent.data().sourcepos;
+        let (line, end_line) = (self.line(sp.start.line), self.line(sp.end.line));
+        let mut inl = Inl::new();
+        inl.text(text);
+        let run = self.finish_run(inl, RunKind::Text);
+        let id = self.block_id("flat", line, end_line);
+        vec![Block {
+            kind: BlockKind::Paragraph {
+                run,
+                align: HAlign::Left,
+            },
+            line,
+            end_line: end_line.max(line),
+            id,
+        }]
     }
 
     fn block<'a>(&mut self, node: &'a AstNode<'a>, sink: &mut Sink) {
@@ -1214,9 +1411,9 @@ impl P<'_> {
                     };
                     n += 1;
                     self.pending_marker = Some(marker);
-                    self.list_depth += 1;
+                    self.list_depth = self.list_depth.saturating_add(1);
                     let blocks = self.blocks(item);
-                    self.list_depth -= 1;
+                    self.list_depth = self.list_depth.saturating_sub(1);
                     self.pending_marker = None;
                     items.push(ListItem { task, blocks });
                 }
@@ -1273,20 +1470,25 @@ impl P<'_> {
                     rt.text.push_str(" ↩");
                     rt.spans.push(Span {
                         range: start..start + 1,
-                        flags: 0,
+                        flags: flags::FOOTBACK,
                         link: None,
                         kind: SpanKind::Text,
                     });
                     rt.spans.push(Span {
                         range: start + 1..rt.text.len(),
-                        flags: flags::LINK,
+                        flags: flags::LINK | flags::FOOTBACK,
                         link: Some(idx),
                         kind: SpanKind::Text,
                     });
                 } else {
                     let mut inl = Inl::new();
                     let idx = inl.add_link(back);
-                    inl.push("↩", flags::LINK, Some(idx), SpanKind::Text);
+                    inl.push(
+                        "↩",
+                        flags::LINK | flags::FOOTBACK,
+                        Some(idx),
+                        SpanKind::Text,
+                    );
                     let run = self.finish_run(inl, RunKind::Text);
                     let id = self.block_id("fnback", line, end_line);
                     blocks.push(Block {
@@ -1566,6 +1768,7 @@ impl P<'_> {
                             flush(self, &mut inl, sink, line, end_line);
                             let open = attrs.iter().any(|(k, _)| k == "open");
                             sink.open(
+                                self,
                                 "details",
                                 FrameKind::Details {
                                     open,
@@ -1629,7 +1832,7 @@ impl P<'_> {
                         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                             flush(self, &mut inl, sink, line, end_line);
                             if center {
-                                sink.open(name, FrameKind::Center, line);
+                                sink.open(self, name, FrameKind::Center, line);
                             }
                             let level = name[1..].parse().unwrap_or(1);
                             inl = Some((Inl::new(), Some(level)));
@@ -1640,7 +1843,7 @@ impl P<'_> {
                         | "caption" => {
                             flush(self, &mut inl, sink, line, end_line);
                             if (center || name == "center") && !self_closing {
-                                sink.open(name, FrameKind::Center, line);
+                                sink.open(self, name, FrameKind::Center, line);
                             }
                             if let Some(id) = Token::attr(attrs, "id").filter(|s| !s.is_empty()) {
                                 self.anchor_block(id, line, end_line, sink);
@@ -1768,6 +1971,33 @@ fn clamp_spans(rt: &mut RichText) {
         s.range.start = s.range.start.min(len);
     }
     rt.spans.retain(|s| s.range.end > s.range.start);
+}
+
+/// The text of an HTML fragment (tags dropped, dangerous elements' content skipped).
+fn html_text(raw: &str, out: &mut String) {
+    let mut skip: Option<(String, u32)> = None;
+    for tok in html::tokenize(raw) {
+        match (&mut skip, tok) {
+            (Some((name, depth)), Token::Start { name: n, .. }) if *name == n => *depth += 1,
+            (Some((name, depth)), Token::End { name: n }) if *name == n => {
+                *depth -= 1;
+                if *depth == 0 {
+                    skip = None;
+                }
+            }
+            (Some(_), _) => {}
+            (
+                None,
+                Token::Start {
+                    name, self_closing, ..
+                },
+            ) if html::is_dangerous(&name) && !self_closing && !html::is_void(&name) => {
+                skip = Some((name, 1));
+            }
+            (None, Token::Text(t)) => out.push_str(&t),
+            _ => {}
+        }
+    }
 }
 
 fn plain_text<'a>(node: &'a AstNode<'a>) -> String {
@@ -2072,6 +2302,40 @@ mod tests {
         assert_eq!(fm.preview, "title: T");
         let p = parse("---\nnot front matter\n", None);
         assert!(!matches!(p.blocks[0].kind, BlockKind::FrontMatter(_)));
+        // Nested YAML, lists, comments, block scalars; multi-line TOML values.
+        let p = parse(
+            "---\n# meta\ntitle: x\nauthors:\n  - a\n  - b\nsummary: |\n  Long text: with colons.\n---\nBody\n",
+            None,
+        );
+        assert!(matches!(p.blocks[0].kind, BlockKind::FrontMatter(_)));
+        let p = parse(
+            "+++\ntitle = \"T\"\ntags = [\n  \"a\",\n  \"b\",\n]\n[params]\nx = 1\n+++\nBody\n",
+            None,
+        );
+        assert!(matches!(p.blocks[0].kind, BlockKind::FrontMatter(_)));
+    }
+
+    #[test]
+    fn a_leading_thematic_break_is_not_front_matter() {
+        let src = "---\n\n# Release notes\n\nSome intro text.\n\n- one\n- two\n\n---\nAfter the second rule.\n";
+        let p = parse(src, None);
+        assert!(matches!(p.blocks[0].kind, BlockKind::Rule));
+        assert!(matches!(p.blocks[1].kind, BlockKind::Heading { .. }));
+        assert_eq!(p.headings.len(), 1);
+        // Not metadata even without the blank line: prose between two rules.
+        let p = parse("---\nJust a sentence here.\n---\nMore.\n", None);
+        assert!(
+            !p.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::FrontMatter(_)))
+        );
+        let p = parse("---\n# Title\n---\n", None);
+        assert!(
+            !p.blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::FrontMatter(_)))
+        );
+        assert_eq!(p.headings.len(), 1);
     }
 
     #[test]
@@ -2101,7 +2365,11 @@ mod tests {
 
     #[test]
     fn links_and_images() {
-        let base = Path::new("/docs");
+        let base = if cfg!(windows) {
+            Path::new(r"C:\docs")
+        } else {
+            Path::new("/docs")
+        };
         let src =
             "[a](./x.md#sec) [b](https://e.com) <https://bare.com> [c](#top) ![i](img/p.png)\n";
         let p = parse(src, Some(base));
@@ -2124,7 +2392,138 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(img.uri.as_deref(), Some("file:///docs/img/p.png"));
+        let want = if cfg!(windows) {
+            r"file:///C:\docs\img\p.png"
+        } else {
+            "file:///docs/img/p.png"
+        };
+        assert_eq!(img.uri.as_deref(), Some(want));
+    }
+
+    fn image_uris(src: &str, base: Option<&Path>) -> Vec<Option<String>> {
+        let p = parse(src, base);
+        p.texts
+            .iter()
+            .flat_map(|t| &t.objects)
+            .filter_map(|o| match o {
+                InlineObject::Image(img) => Some(img.uri.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn images_never_reach_other_machines() {
+        let base = if cfg!(windows) {
+            Path::new(r"C:\docs")
+        } else {
+            Path::new("/docs")
+        };
+        // (Markdown unescapes `\\` in a destination to `\`; HTML attributes are taken as is.)
+        let src = r#"x ![a](file://evil/x.png) ![b](//evil/s/x.png) ![c](\\\\evil\\s\\x.png)
+<img src="\\evil\s\y.png"> <img src="//evil/s/y.png"> ![d](file:////evil/s/x.png)
+![e](/\\evil\\s\\x.png) ![f](FILE://evil.example/s/x.png)
+"#;
+        let uris = image_uris(src, Some(base));
+        assert_eq!(uris.len(), 8);
+        assert!(uris.iter().all(Option::is_none), "{uris:?}");
+        // Pasted text has no folder: relative images resolve to nothing.
+        assert_eq!(image_uris("x ![](assets/logo.png)\n", None), vec![None]);
+        // Local files still load, including `file:///` and `file://localhost/` sources.
+        let ok = image_uris(
+            "x ![](img/p.png) ![](file:///docs/q.png) ![](file://localhost/docs/r.png)\n",
+            Some(base),
+        );
+        assert!(ok.iter().all(Option::is_some), "{ok:?}");
+        if !cfg!(windows) {
+            assert_eq!(ok[1].as_deref(), Some("file:///docs/q.png"));
+            assert_eq!(ok[2].as_deref(), Some("file:///docs/r.png"));
+        }
+    }
+
+    #[test]
+    fn links_never_reach_other_machines() {
+        let p = parse(
+            r"[a](file://evil/s/a.md) [b](//evil/s/a.md) [c](\\\\evil\\s\\a.md) [d](file:///docs/a.md#x)",
+            Some(Path::new("/docs")),
+        );
+        let dests: Vec<_> = p.texts[0].links.iter().map(|l| l.dest.clone()).collect();
+        for (d, href) in dests[..3]
+            .iter()
+            .zip(["file://evil/s/a.md", "//evil/s/a.md"])
+        {
+            assert_eq!(d, &LinkDest::External(href.into()));
+        }
+        assert!(matches!(dests[2], LinkDest::External(_)));
+        assert!(matches!(&dests[3], LinkDest::File { anchor: Some(a), .. } if a == "x"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_image_uris() {
+        let uris = image_uris(
+            "x ![](img/p.png) ![](C:/x.png) ![](file:///C:/y%20z.png)\n",
+            Some(Path::new(r"C:\docs")),
+        );
+        assert_eq!(uris[0].as_deref(), Some(r"file:///C:\docs\img\p.png"));
+        assert_eq!(uris[1].as_deref(), Some(r"file:///C:\x.png"));
+        assert_eq!(uris[2].as_deref(), Some(r"file:///C:\y z.png"));
+        let back = crate::paths::file_uri_to_path(uris[0].as_deref().unwrap());
+        assert_eq!(back.as_deref(), Some(Path::new(r"C:\docs\img\p.png")));
+        // A document on a share shows images from that share, and only that share.
+        let share = Some(Path::new(r"\\nas\docs"));
+        let uris = image_uris(
+            "x ![](img/p.png) ![](//nas/docs/q.png) ![](//nas/other/q.png)\n",
+            share,
+        );
+        assert_eq!(uris[0].as_deref(), Some(r"file:///\\nas\docs\img\p.png"));
+        assert!(uris[1].is_some());
+        assert_eq!(uris[2], None);
+    }
+
+    #[test]
+    fn deep_nesting_is_flattened_not_dropped() {
+        fn depth(blocks: &[Block]) -> usize {
+            blocks
+                .iter()
+                .map(|b| {
+                    1 + match &b.kind {
+                        BlockKind::Quote(v) | BlockKind::Center(v) => depth(v),
+                        BlockKind::Alert { blocks, .. } | BlockKind::Details { blocks, .. } => {
+                            depth(blocks)
+                        }
+                        BlockKind::List(l) => {
+                            l.items.iter().map(|i| depth(&i.blocks)).max().unwrap_or(0)
+                        }
+                        _ => 0,
+                    }
+                })
+                .max()
+                .unwrap_or(0)
+        }
+        // MAX_BLOCK_DEPTH + 1 containers, then the flattened paragraph.
+        let max = MAX_BLOCK_DEPTH as usize + 2;
+        for src in [
+            format!("{}deep\n", "> ".repeat(100)),
+            (0..100)
+                .map(|i| format!("{}- item {i}\n", "  ".repeat(i)))
+                .collect(),
+            format!(
+                "{}\ndeep\n\n{}",
+                "<details>\n".repeat(100),
+                "</details>\n".repeat(100)
+            ),
+        ] {
+            let p = parse(&src, None);
+            assert!(depth(&p.blocks) <= max, "{}", depth(&p.blocks));
+            let all: String = p.texts.iter().map(|t| t.plain()).collect();
+            assert!(all.contains("deep") || all.contains("item 99"), "{all}");
+        }
+        let p = parse(
+            &format!("{}deep{}\n", "*".repeat(400), "*".repeat(400)),
+            None,
+        );
+        assert!(p.texts[0].plain().contains("deep"));
     }
 
     #[test]
