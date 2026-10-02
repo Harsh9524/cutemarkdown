@@ -122,6 +122,10 @@ pub struct DocOutput {
     pub progress: f32,
     /// Something (e.g. a code block) was copied to the clipboard this frame; the shell may toast.
     pub copied: bool,
+    /// Readable words below the top of the viewport (code excluded), for "N min left".
+    pub words_remaining: usize,
+    /// 1-based source line of the first visible block (for "Open in editor here").
+    pub top_source_line: usize,
 }
 
 /// Result of a find operation.
