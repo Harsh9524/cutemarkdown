@@ -5,10 +5,12 @@
 
 pub mod aa;
 pub mod app_bar;
+pub mod autohide;
 pub mod empty;
 pub mod find_bar;
 pub mod menu;
 pub mod outline;
+pub mod overlays;
 pub mod progress;
 pub mod toast;
 pub mod widgets;

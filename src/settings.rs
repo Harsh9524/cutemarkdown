@@ -351,6 +351,10 @@ impl SettingsStore {
         self.writable = writable && self.path.is_some();
     }
 
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// Call after changing `data`; the write happens ≥ 500 ms later.
     pub fn mark_dirty(&mut self) {
         self.dirty_since.get_or_insert_with(Instant::now);

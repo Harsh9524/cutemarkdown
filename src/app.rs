@@ -87,6 +87,10 @@ pub struct App {
     frame_no: u32,
     title: String,
     wheel: WheelZoom,
+    autohide: ui::autohide::AutoHide,
+    /// Last user scroll input (wheel, scroll keys, pointer drag) and last app-driven scroll.
+    user_scroll_at: Option<Instant>,
+    programmatic_at: Option<Instant>,
     /// Modifiers at the end of the previous frame (to replay this frame's changes in order).
     modifiers: Modifiers,
     docked_fits: bool,
@@ -121,6 +125,9 @@ impl App {
             frame_no: 0,
             title: String::new(),
             wheel: WheelZoom::default(),
+            autohide: Default::default(),
+            user_scroll_at: None,
+            programmatic_at: None,
             modifiers: Modifiers::NONE,
             docked_fits: true,
             bar: Default::default(),
@@ -184,6 +191,7 @@ impl App {
     }
 
     fn install_doc(&mut self, doc: Doc, anchor: Option<String>) {
+        self.programmatic_at = Some(Instant::now());
         self.doc = Some(doc);
         self.ui.outline_overlay = false;
         self.ui.hovered_link = None;
@@ -231,6 +239,7 @@ impl App {
 
     /// Re-read the current file. Returns whether the content changed.
     fn reload_from_disk(&mut self) -> Result<bool, String> {
+        self.programmatic_at = Some(Instant::now());
         let Some(doc) = self.doc.as_mut() else {
             return Ok(false);
         };
@@ -402,6 +411,7 @@ impl App {
     // ---- find ------------------------------------------------------------------------------
 
     fn send_find_query(&mut self) {
+        self.programmatic_at = Some(Instant::now());
         let f = &mut self.ui.find;
         f.edited_at = None;
         let Some(d) = self.doc.as_mut() else { return };
@@ -449,6 +459,19 @@ impl App {
     // ---- actions ---------------------------------------------------------------------------
 
     fn apply(&mut self, ctx: &egui::Context, frame: &eframe::Frame, action: Action) {
+        // App-driven scrolls never count as the reader scrolling (app bar auto-hide).
+        if matches!(
+            action,
+            Action::Back
+                | Action::Forward
+                | Action::Link(..)
+                | Action::ScrollToHeading(_)
+                | Action::HeadingStep(_)
+                | Action::FindNext
+                | Action::FindPrev
+        ) {
+            self.programmatic_at = Some(Instant::now());
+        }
         match action {
             Action::OpenDialog => {
                 let mut dialog = rfd::FileDialog::new()
@@ -656,8 +679,37 @@ impl App {
     fn handle_input(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
         let typing = ctx.egui_wants_keyboard_input();
+        let nothing_focused = ctx.memory(|m| m.focused().is_none());
         let has_doc = self.doc.is_some();
         ctx.input_mut(|i| {
+            // Reader-driven scrolling (for app bar auto-hide): wheel, scroll keys, drags.
+            let user_scroll = i.pointer.primary_down()
+                || i.raw.events.iter().any(|e| match e {
+                    Event::MouseWheel { modifiers, .. } => !modifiers.command,
+                    Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        !typing
+                            && !modifiers.command
+                            && matches!(
+                                key,
+                                Key::ArrowUp
+                                    | Key::ArrowDown
+                                    | Key::PageUp
+                                    | Key::PageDown
+                                    | Key::Space
+                                    | Key::Home
+                                    | Key::End
+                            )
+                    }
+                    _ => false,
+                });
+            if user_scroll {
+                self.user_scroll_at = Some(Instant::now());
+            }
             let ctrl = Modifiers::COMMAND;
             let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
             // Shift variants first: consume_key ignores extra Shift.
@@ -741,6 +793,15 @@ impl App {
                     actions.push(Action::FindPrev);
                 } else if key(Modifiers::NONE, Key::F3) {
                     actions.push(Action::FindNext);
+                }
+                // Enter steps matches from anywhere, unless a button has focus (Tab + Enter).
+                // While the input is focused, the find bar handles Enter itself.
+                if nothing_focused {
+                    if key(Modifiers::SHIFT, Key::Enter) {
+                        actions.push(Action::FindPrev);
+                    } else if key(Modifiers::NONE, Key::Enter) {
+                        actions.push(Action::FindNext);
+                    }
                 }
             } else if has_doc && key(Modifiers::NONE, Key::F3) {
                 actions.push(Action::OpenFind);
@@ -907,7 +968,10 @@ impl App {
     }
 
     /// QA setup applied on the first frame.
-    fn qa_setup(&mut self) {
+    fn qa_setup(&mut self, ctx: &egui::Context) {
+        if self.args.zen {
+            self.set_zen(ctx, true);
+        }
         if let Some(q) = self.args.find.clone() {
             self.ui.find.open = true;
             self.ui.find.query = q;
@@ -972,6 +1036,21 @@ impl App {
     }
 }
 
+/// "8 min left" (230 words per minute; "<1 min left" near the end). Until the engine reports
+/// `words_remaining`, estimate it from the total and the reading progress.
+fn time_left(out: &DocOutput, total_words: usize) -> String {
+    let words = if out.words_remaining > 0 || out.progress >= 0.999 {
+        out.words_remaining
+    } else {
+        (total_words as f32 * (1.0 - out.progress)).round() as usize
+    };
+    if words < 230 {
+        "<1 min left".into()
+    } else {
+        format!("{} min left", (words as f32 / 230.0).round() as usize)
+    }
+}
+
 fn demo_recents() -> Vec<RecentEntry> {
     let here = std::env::current_dir().unwrap_or_default();
     let samples = here.join("samples");
@@ -1014,12 +1093,13 @@ impl eframe::App for App {
                 self.settings.data.renderer = self.renderer;
                 self.settings.mark_dirty();
             }
-            self.qa_setup();
+            self.qa_setup(&ctx);
         }
         if self.frame_no == 3
             && let (Some(px), Some(d)) = (self.args.scroll, self.doc.as_mut())
         {
             d.view.set_scroll_offset(px);
+            self.programmatic_at = Some(Instant::now());
         }
         self.sync_theme(&ctx, frame);
         self.poll_watcher();
@@ -1081,7 +1161,7 @@ impl eframe::App for App {
             let props = outline::OutlineProps {
                 entries: &doc.outline,
                 active: out.active_heading,
-                time_left: None,
+                time_left: Some(time_left(&out, doc.view.document().word_count())),
             };
             outline::show_docked(root, screen, docked_t, &props, &p, &mut actions);
             outline::show_overlay(&ctx, screen, overlay_t, &props, &p, &mut actions);
@@ -1091,8 +1171,33 @@ impl eframe::App for App {
             self.out = DocOutput::default();
         }
 
-        // App bar.
+        // App bar, auto-hiding while reading (always shown on the empty state).
         let has_doc = self.doc.is_some();
+        let now = Instant::now();
+        let recent = |t: Option<Instant>, ms: u64| {
+            t.is_some_and(|t| now.duration_since(t) < Duration::from_millis(ms))
+        };
+        let (pointer_y, alt) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos().map(|p| p.y - screen.top()),
+                i.modifiers.alt,
+            )
+        });
+        let bar_input = ui::autohide::BarInput {
+            now,
+            scroll_y,
+            user_scrolling: recent(self.user_scroll_at, 400) && !recent(self.programmatic_at, 600),
+            pointer_y,
+            hovered: self.bar.hovered,
+            pinned: self.ui.bar_pinned(),
+            alt,
+            zen: self.ui.zen,
+        };
+        let shown = self.autohide.update(&bar_input) || !has_doc;
+        if !shown && pointer_y.is_some_and(|y| y <= 56.0) {
+            ctx.request_repaint_after(Duration::from_millis(50)); // top-edge dwell
+        }
+        let shown_t = ctx.animate_bool_with_time(Id::new("bar-shown"), shown, PANEL_SECS);
         let border_t = ctx.animate_bool_with_time(Id::new("bar-border"), scroll_y > 0.0, 0.12);
         let props = ui::app_bar::BarProps {
             has_doc,
@@ -1105,7 +1210,7 @@ impl eframe::App for App {
             popover: self.ui.popover,
             missing: self.doc.as_ref().is_some_and(|d| d.missing),
             border_t,
-            shown_t: 1.0,
+            shown_t,
         };
         self.bar = ui::app_bar::show(&ctx, screen, &props, &p, &mut actions);
 
@@ -1178,6 +1283,39 @@ impl eframe::App for App {
         }
         if has_doc {
             ui::progress::show(&ctx, screen, self.out.progress, &p);
+        }
+
+        // Link status pill: 300 ms after hovering a link, gone as soon as the pointer leaves.
+        let hovered = self
+            .out
+            .hovered_link
+            .clone()
+            .or_else(|| self.args.hover_link.clone());
+        match hovered {
+            Some(url)
+                if self
+                    .ui
+                    .hovered_link
+                    .as_ref()
+                    .is_some_and(|(u, _)| *u == url) => {}
+            Some(url) => self.ui.hovered_link = Some((url, now)),
+            None => self.ui.hovered_link = None,
+        }
+        if let Some((url, since)) = &self.ui.hovered_link {
+            let wait = Duration::from_millis(300).saturating_sub(since.elapsed());
+            if wait.is_zero() {
+                ui::overlays::link_pill(&ctx, screen, url, &p);
+            } else {
+                ctx.request_repaint_after(wait);
+            }
+        }
+
+        if self.ui.shortcuts {
+            ui::overlays::shortcuts(&ctx, screen, &p, &mut actions);
+        }
+        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if dragging || self.args.open == Some(Open::Drag) {
+            ui::overlays::drag_overlay(&ctx, screen, &p);
         }
 
         for a in actions {

@@ -146,8 +146,10 @@ fn native_options(
     let mut options = eframe::NativeOptions {
         viewport,
         centered,
-        // Geometry lives in our settings JSON; eframe's own persistence stays unused.
+        // Geometry lives in our settings JSON; eframe's own persistence stays unused. Pointing
+        // it next to our settings keeps eframe from creating a separate data folder.
         persist_window: false,
+        persistence_path: settings.path().map(|p| p.with_file_name("eframe.ron")),
         ..Default::default()
     };
     if let Some(backends) = renderer_backends(renderer)

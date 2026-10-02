@@ -290,3 +290,22 @@ pub fn switch(ui: &mut Ui, rect: Rect, id_salt: &str, on: bool, p: &Palette) -> 
     }
     resp
 }
+
+/// Outline of a rounded rectangle as a convex polygon (clockwise in screen space).
+pub fn rounded_rect_points(r: Rect, radius: f32) -> Vec<Pos2> {
+    const N: usize = 8;
+    let corners = [
+        (pos2(r.right() - radius, r.top() + radius), -90.0f32),
+        (pos2(r.right() - radius, r.bottom() - radius), 0.0),
+        (pos2(r.left() + radius, r.bottom() - radius), 90.0),
+        (pos2(r.left() + radius, r.top() + radius), 180.0),
+    ];
+    let mut pts = Vec::with_capacity(4 * (N + 1));
+    for (c, start) in corners {
+        for i in 0..=N {
+            let a = (start + 90.0 * i as f32 / N as f32).to_radians();
+            pts.push(c + radius * vec2(a.cos(), a.sin()));
+        }
+    }
+    pts
+}

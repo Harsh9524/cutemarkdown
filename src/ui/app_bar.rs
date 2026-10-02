@@ -27,7 +27,6 @@ pub struct BarProps {
 /// Rects other layers anchor to.
 #[derive(Clone, Copy, Debug)]
 pub struct BarOut {
-    pub rect: Rect,
     pub aa_button: Rect,
     pub menu_button: Rect,
     pub hovered: bool,
@@ -36,7 +35,6 @@ pub struct BarOut {
 impl Default for BarOut {
     fn default() -> Self {
         Self {
-            rect: Rect::NOTHING,
             aa_button: Rect::NOTHING,
             menu_button: Rect::NOTHING,
             hovered: false,
@@ -57,10 +55,7 @@ pub fn show(
 ) -> BarOut {
     let y = screen.top() - BAR_H * (1.0 - props.shown_t);
     let rect = Rect::from_min_size(pos2(screen.left(), y), vec2(screen.width(), BAR_H));
-    let mut out = BarOut {
-        rect,
-        ..Default::default()
-    };
+    let mut out = BarOut::default();
     if props.shown_t <= 0.0 {
         return out;
     }
@@ -73,7 +68,10 @@ pub fn show(
             let bg = ui.allocate_rect(rect, Sense::click());
             out.hovered = bg.hovered() || ui.rect_contains_pointer(rect);
             let painter = ui.painter();
-            painter.rect_filled(rect, 0.0, p.bg.gamma_multiply(0.94));
+            // `bg` at 94% once content can scroll under the bar; opaque before that, so blending
+            // rounding never draws a faint edge over plain background.
+            let alpha = egui::lerp(1.0..=0.94, props.border_t);
+            painter.rect_filled(rect, 0.0, p.bg.gamma_multiply(alpha));
             if props.border_t > 0.0 {
                 painter.hline(
                     rect.x_range(),
@@ -122,7 +120,7 @@ pub fn show(
                         st,
                         p,
                     );
-                    if tooltip(r, "Back", Some("Alt+←"), p).clicked() {
+                    if tooltip(r, "Back", Some("Alt+Left"), p).clicked() {
                         actions.push(Action::Back);
                     }
                     x += BTN + GAP;
@@ -138,7 +136,7 @@ pub fn show(
                         st,
                         p,
                     );
-                    if tooltip(r, "Forward", Some("Alt+→"), p).clicked() {
+                    if tooltip(r, "Forward", Some("Alt+Right"), p).clicked() {
                         actions.push(Action::Forward);
                     }
                 }

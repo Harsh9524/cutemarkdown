@@ -1,8 +1,11 @@
-//! Win32 calls (compiled on Windows only).
+//! Windows: Shell and DWM calls via `windows-sys`.
 
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{HWND, RECT};
@@ -20,8 +23,38 @@ fn wide(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
+use super::spawn_detached;
+
+/// Open an `http(s)`/`mailto` URL with the default handler.
+pub fn open_url(url: &str) -> io::Result<()> {
+    shell_execute("open", url.as_ref())
+}
+
+/// Open an allowlisted local file with its associated app.
+pub fn open_with_system(path: &Path) -> io::Result<()> {
+    shell_execute("open", path.as_os_str())
+}
+
+/// Show `path` selected in Explorer.
+pub fn reveal(path: &Path) -> io::Result<()> {
+    // explorer parses its own command line; `/select,"path"` must be passed verbatim.
+    spawn_detached(Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())))
+}
+
+/// The shell `edit` verb (the user's editor for that type), else Notepad.
+pub fn open_in_editor(path: &Path) -> io::Result<()> {
+    shell_execute("edit", path.as_os_str())
+        .or_else(|_| spawn_detached(Command::new("notepad.exe").arg(path)))
+}
+
+/// Last-resort error report when no window can be shown.
+pub fn fatal_message(title: &str, text: &str) {
+    eprintln!("{title}: {text}");
+    message_box(title, text);
+}
+
 /// `ShellExecuteW(verb, file)`. Values ≤ 32 are errors.
-pub fn shell_execute(verb: &str, file: &OsStr) -> io::Result<()> {
+fn shell_execute(verb: &str, file: &OsStr) -> io::Result<()> {
     let verb = wide(verb.as_ref());
     let file = wide(file);
     // SAFETY: both strings are NUL-terminated UTF-16 buffers that outlive the call.
@@ -45,6 +78,7 @@ pub fn shell_execute(verb: &str, file: &OsStr) -> io::Result<()> {
     }
 }
 
+/// Whether a window rectangle (logical points) overlaps any monitor.
 pub fn rect_on_screen(x: f32, y: f32, w: f32, h: f32) -> bool {
     // SAFETY: no arguments.
     let scale = unsafe { GetDpiForSystem() } as f32 / 96.0;
@@ -70,6 +104,7 @@ fn colorref(c: egui::Color32) -> u32 {
     u32::from(c.r()) | (u32::from(c.g()) << 8) | (u32::from(c.b()) << 16)
 }
 
+/// Caption color = `bg` (Windows 11) and immersive dark mode in Dark (Windows 10 20H1+).
 pub fn style_title_bar(
     frame: &eframe::Frame,
     caption: egui::Color32,
@@ -91,7 +126,7 @@ pub fn style_title_bar(
     }
 }
 
-pub fn message_box(title: &str, text: &str) {
+fn message_box(title: &str, text: &str) {
     let (title, text) = (wide(title.as_ref()), wide(text.as_ref()));
     // SAFETY: NUL-terminated UTF-16 buffers that outlive the call.
     unsafe {

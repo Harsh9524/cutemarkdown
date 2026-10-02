@@ -217,7 +217,7 @@ fn paint_swatch(ui: &Ui, r: Rect, pref: ThemePref, current: &Palette) {
         let a = r.right_top();
         let b = r.left_bottom();
         let dark_side = |q: Pos2| (b - a).x * (q - a).y - (b - a).y * (q - a).x <= 0.0;
-        let poly = clip_half_plane(&rounded_rect_points(r, 8.0), a, b, dark_side);
+        let poly = clip_half_plane(&widgets::rounded_rect_points(r, 8.0), a, b, dark_side);
         painter.add(Shape::convex_polygon(poly, dark.bg, Stroke::NONE));
         // "Aa" in each half's text color, drawn through one-pixel column clips along the diagonal.
         let px = 1.0 / ui.ctx().pixels_per_point();
@@ -245,25 +245,6 @@ fn paint_swatch(ui: &Ui, r: Rect, pref: ThemePref, current: &Palette) {
     }
     // Keep light swatches visible on a light surface.
     painter.rect_stroke(r, 8.0, Stroke::new(1.0, current.border), StrokeKind::Inside);
-}
-
-/// Outline of a rounded rectangle as a convex polygon (clockwise in screen space).
-fn rounded_rect_points(r: Rect, radius: f32) -> Vec<Pos2> {
-    const N: usize = 8;
-    let corners = [
-        (pos2(r.right() - radius, r.top() + radius), -90.0f32),
-        (pos2(r.right() - radius, r.bottom() - radius), 0.0),
-        (pos2(r.left() + radius, r.bottom() - radius), 90.0),
-        (pos2(r.left() + radius, r.top() + radius), 180.0),
-    ];
-    let mut pts = Vec::with_capacity(4 * (N + 1));
-    for (c, start) in corners {
-        for i in 0..=N {
-            let a = (start + 90.0 * i as f32 / N as f32).to_radians();
-            pts.push(c + radius * vec2(a.cos(), a.sin()));
-        }
-    }
-    pts
 }
 
 /// Sutherland–Hodgman clip of a convex polygon to the side of line a→b where `keep` holds.
