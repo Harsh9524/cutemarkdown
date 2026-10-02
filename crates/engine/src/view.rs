@@ -34,6 +34,42 @@ struct LayoutKey {
     wrap: bool,
     ppp: u32,
     fonts: u64,
+    /// egui font-atlas epoch: galleys laid out against an older atlas have stale glyph UVs.
+    atlas: u64,
+}
+
+/// Tracks egui's font atlas so cached galleys can be dropped when it is recreated.
+///
+/// `epaint::Fonts::begin_pass` throws the whole atlas away when the text options change (e.g. a
+/// theme switch changes `text_alpha_from_coverage`) or when it is more than 80% full. Galleys we
+/// keep across frames then point at glyphs that no longer exist and render as garbage. egui gives
+/// no explicit signal, but the fill ratio only ever grows between resets, so a drop (or an
+/// options change) means "re-lay out everything".
+#[derive(Default)]
+struct AtlasWatch {
+    epoch: u64,
+    last_fill: Option<f32>,
+    last_options: Option<egui::epaint::TextOptions>,
+}
+
+impl AtlasWatch {
+    /// Call at the start of `show`; returns the current atlas epoch.
+    fn epoch(&mut self, ctx: &egui::Context) -> u64 {
+        let (fill, options) = ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.options().clone()));
+        let reset = self.last_fill.is_some_and(|last| fill + 1e-6 < last)
+            || self.last_options.as_ref().is_some_and(|o| *o != options);
+        if reset {
+            self.epoch += 1;
+        }
+        self.last_fill = Some(fill);
+        self.last_options = Some(options);
+        self.epoch
+    }
+
+    /// Call at the end of `show`, after this frame's layouts have added their glyphs.
+    fn note_end_of_frame(&mut self, ctx: &egui::Context) {
+        self.last_fill = Some(ctx.fonts(|f| f.font_atlas_fill_ratio()));
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -161,6 +197,8 @@ pub(crate) struct ViewState {
     flash: Option<(String, f64)>,
     sb: Scrollbar,
     fallbacks_requested: bool,
+    /// Detects egui recreating its font atlas (see [`AtlasWatch`]).
+    atlas: AtlasWatch,
     hovered_link_since: Option<(String, f64)>,
     /// Footnote hover card: (footnote name, pointer position) requested this frame.
     card_request: Option<(String, Pos2)>,
@@ -211,6 +249,7 @@ impl ViewState {
                 drag_grab: None,
             },
             fallbacks_requested: false,
+            atlas: AtlasWatch::default(),
             hovered_link_since: None,
             card_request: None,
             card_cache: None,
@@ -738,6 +777,7 @@ impl ViewState {
             }
         }
         let font_gen = crate::fonts::generation();
+        let atlas_epoch = self.atlas.epoch(&ctx);
         self.reduce_motion = ui.style().animation_time <= 0.0;
 
         // Geometry.
@@ -768,6 +808,7 @@ impl ViewState {
             wrap: style.wrap_code,
             ppp: ctx.pixels_per_point().to_bits(),
             fonts: font_gen,
+            atlas: atlas_epoch,
         };
         if self.key != Some(key) {
             let t_changed = self.key.is_some_and(|k| k.t != key.t);
@@ -868,6 +909,7 @@ impl ViewState {
         // 6. Outputs.
         self.outputs(doc, &mut out);
         crate::fonts::poll_fallbacks(&ctx);
+        self.atlas.note_end_of_frame(&ctx);
         self.last_show_secs = t_start.elapsed().as_secs_f64();
         out
     }
