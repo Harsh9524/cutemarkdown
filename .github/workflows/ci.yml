@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same ref cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Linux (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No apt packages are needed: eframe loads X11, Wayland, xkbcommon and the GPU drivers
+      # with dlopen at run time, so nothing is linked at build time and the tests are headless.
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Warnings are allowed for now; only clippy errors fail the job.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  windows:
+    name: Windows (release build, installer, portable zip)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # MSVC target, static CRT (.cargo/config.toml), icon/manifest embedded by build.rs.
+      - name: Build release
+        run: cargo build --release --locked --bin cutemarkdown
+
+      - name: Check imports (Windows system DLLs only)
+        run: python scripts/check-imports.py target/release/cutemarkdown.exe
+
+      # NSIS is preinstalled on GitHub's Windows images; install it only if it is missing.
+      - name: Ensure NSIS
+        run: |
+          if ! command -v makensis >/dev/null 2>&1 \
+             && [ ! -x "/c/Program Files (x86)/NSIS/makensis.exe" ] \
+             && [ ! -x "/c/Program Files/NSIS/makensis.exe" ]; then
+            choco install nsis -y --no-progress
+          fi
+
+      - name: Package (installer and portable zip)
+        run: bash scripts/package.sh --exe target/release/cutemarkdown.exe --out dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutemarkdown-windows-x64
+          path: |
+            dist/*-setup-x64.exe
+            dist/*-portable-x64.zip
+          if-no-files-found: error
